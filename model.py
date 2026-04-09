@@ -11,47 +11,70 @@ from torch import nn
 
 @dataclass
 class ModelArgs:
-    # default hyperparameters for the Llama 7B model
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
+    head_dim: Optional[int] = None  # explicit head dim; if None, uses dim // n_heads
     vocab_size: int = 32000
     hidden_dim: Optional[int] = None
     multiple_of: int = 256  # MLP hidden layer size will be multiple of
-    norm_eps: float = 1e-5
+    norm_eps: float = 1e-6
     max_seq_len: int = 2048
     dropout: float = 0.0
+    rope_base: float = 10_000_000.0
+    partial_rotary_factor: float = 0.25
+    # layer type pattern: "full" or "linear", repeating. None = all full attention.
+    layer_types: Optional[Tuple[str, ...]] = None
+    # linear attention (Gated Delta Net) params
+    linear_num_key_heads: int = 16
+    linear_num_value_heads: int = 16
+    linear_key_head_dim: int = 128
+    linear_value_head_dim: int = 128
+    linear_conv_kernel_dim: int = 4
 
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float):
+    """Qwen3.5-style RMSNorm: zero-init weight, forward is x_norm * (1 + weight)."""
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.zeros(dim))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        return output * (1.0 + self.weight)
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cos = torch.cos(freqs)  # real part
-    freqs_sin = torch.sin(freqs)  # imaginary part
-    return freqs_cos, freqs_sin
+class RMSNormGated(torch.nn.Module):
+    """Gated RMSNorm for linear attention layers: norm(x) * weight * SiLU(gate)."""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(shape)
+    def forward(self, x, gate):
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        x = self.weight * x.to(input_dtype)
+        x = x * F.silu(gate.to(torch.float32))
+        return x.to(input_dtype)
+
+
+def precompute_freqs_cis(head_dim: int, end: int, theta: float = 10_000_000.0, partial_rotary_factor: float = 0.25):
+    """Precompute cos/sin for partial RoPE. Only rotary_dim dimensions are rotated."""
+    rotary_dim = int(head_dim * partial_rotary_factor)
+    rotary_dim = max(2, rotary_dim - (rotary_dim % 2))  # ensure even
+    inv_freq = 1.0 / (theta ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim))
+    t = torch.arange(end)
+    freqs = torch.outer(t, inv_freq).float()
+    # duplicate for paired rotation: [cos(f0), cos(f1), ..., cos(f0), cos(f1), ...]
+    freqs = torch.cat([freqs, freqs], dim=-1)
+    return torch.cos(freqs), torch.sin(freqs)
 
 def apply_rotary_emb(
     xq: torch.Tensor,
@@ -59,26 +82,25 @@ def apply_rotary_emb(
     freqs_cos: torch.Tensor,
     freqs_sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply partial RoPE. freqs have rot_dim columns; remaining dims pass through."""
+    # xq, xk: (bs, n_heads, seqlen, head_dim) -- already transposed
+    seq_len = xq.shape[2]
+    head_dim = xq.shape[-1]
+    rot_dim = freqs_cos.shape[-1]
 
-    # reshape xq and xk to match the complex representation
-    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
-    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
+    cos = freqs_cos[:seq_len].unsqueeze(0).unsqueeze(0)  # (1, 1, seq, rot_dim)
+    sin = freqs_sin[:seq_len].unsqueeze(0).unsqueeze(0)
 
-    # reshape freqs_cos and freqs_sin for broadcasting
-    freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
-    freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
+    def _rotate(x):
+        x_rot = x[..., :rot_dim].float()
+        x_pass = x[..., rot_dim:]
+        half = rot_dim // 2
+        x1, x2 = x_rot[..., :half], x_rot[..., half:]
+        rotated = torch.cat((-x2, x1), dim=-1)
+        x_rot = (x_rot * cos + rotated * sin).type_as(x)
+        return torch.cat([x_rot, x_pass], dim=-1)
 
-    # apply rotation using real numbers
-    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
-    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
-    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
-    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
-
-    # flatten last two dimensions
-    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
-    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
-
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    return _rotate(xq), _rotate(xk)
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
@@ -92,24 +114,30 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 class Attention(nn.Module):
+    """Qwen3.5-style full attention with gated Q projection and QK norm."""
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         assert args.n_heads % self.n_kv_heads == 0
-        model_parallel_size = 1
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.n_heads = args.n_heads
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.head_dim = args.head_dim if args.head_dim is not None else args.dim // args.n_heads
+        self.d_out = self.n_heads * self.head_dim
+
+        # Gated Q: projects to 2x for (query, gate) split
+        self.wq = nn.Linear(args.dim, self.d_out * 2, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        self.wo = nn.Linear(self.d_out, args.dim, bias=False)
+
+        # QK norm (per-head RMSNorm, applied before RoPE)
+        self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
+
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
 
-        # use flash attention or a manual implementation?
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -125,43 +153,224 @@ class Attention(nn.Module):
     ):
         bsz, seqlen, _ = x.shape
 
-        # QKV
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        # Gated Q projection: split into queries and gate
+        q_and_gate = self.wq(x).view(bsz, seqlen, self.n_heads, self.head_dim * 2)
+        xq, gate = torch.chunk(q_and_gate, 2, dim=-1)  # each (bsz, seqlen, n_heads, head_dim)
+        gate = gate.reshape(bsz, seqlen, self.d_out)  # flatten heads for later gating
 
-        # RoPE relative positional embeddings
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+        xk = self.wk(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xv = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
-        # grouped multiquery attention: expand out keys and values
-        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        # QK norm before RoPE (operates on last dim = head_dim, broadcasts over heads)
+        xq = self.q_norm(xq)
+        xk = self.k_norm(xk)
 
-        # make heads into a batch dimension
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        # transpose to (bs, heads, seqlen, head_dim) for RoPE and attention
+        xq = xq.transpose(1, 2)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
-        # flash implementation
+        # RoPE (partial rotary)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+
+        # GQA: expand KV heads
+        xk = repeat_kv(xk.transpose(1, 2), self.n_rep).transpose(1, 2)
+        xv = repeat_kv(xv.transpose(1, 2), self.n_rep).transpose(1, 2)
+
+        # attention
         if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
-            # manual implementation
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             assert hasattr(self, 'mask')
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + self.mask[:, :, :seqlen, :seqlen]
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
-            output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
+            output = torch.matmul(scores, xv)
 
-        # restore time as batch dimension and concat heads
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        # concat heads -> (bsz, seqlen, d_out)
+        context = output.transpose(1, 2).contiguous().view(bsz, seqlen, self.d_out)
 
-        # final projection into the residual stream
-        output = self.wo(output)
+        # apply sigmoid gate from the Q projection
+        context = context * torch.sigmoid(gate)
+
+        output = self.wo(context)
         output = self.resid_dropout(output)
         return output
+
+
+def l2norm(x, dim=-1, eps=1e-6):
+    """L2 normalize along dim."""
+    return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+
+
+def torch_causal_conv1d(hidden_states, weight, bias=None):
+    """Naive causal 1D depthwise conv with SiLU activation.
+    hidden_states: (batch, channels, seq_len)
+    weight: (channels, 1, kernel_size) -- depthwise
+    """
+    channels, _, kernel_size = weight.shape
+    padding = kernel_size - 1
+    out = F.conv1d(hidden_states, weight, bias, padding=padding, groups=channels)
+    out = F.silu(out[..., :hidden_states.shape[-1]])
+    return out
+
+
+def chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64,
+                           initial_state=None, output_final_state=False):
+    """Chunked gated delta rule -- naive PyTorch implementation.
+    All inputs: (batch, heads, seq_len, dim) except g, beta: (batch, heads, seq_len).
+    L2 norm on Q, K is applied by caller.
+    """
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
+    ]
+    batch_size, num_heads, seq_len, k_dim = key.shape
+    v_dim = value.shape[-1]
+
+    pad_size = (chunk_size - seq_len % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+    total_len = seq_len + pad_size
+    scale = 1.0 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    query, key, value, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, k_beta, v_beta)
+    ]
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
+
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+
+    state = (
+        torch.zeros(batch_size, num_heads, k_dim, v_dim, device=value.device, dtype=value.dtype)
+        if initial_state is None else initial_state.to(value)
+    )
+    core_out = torch.zeros_like(value)
+    mask2 = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
+
+    for i in range(total_len // chunk_size):
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        attn_i = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask2, 0)
+        v_prime = k_cumdecay[:, :, i] @ state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ state
+        core_out[:, :, i] = attn_inter + attn_i @ v_new
+        state = (
+            state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    final_state = state if output_final_state else None
+    core_out = core_out.reshape(core_out.shape[0], core_out.shape[1], -1, core_out.shape[-1])
+    core_out = core_out[:, :, :seq_len]
+    return core_out.transpose(1, 2).contiguous().to(query.dtype), final_state
+
+
+class LinearAttention(nn.Module):
+    """Qwen3.5 Gated Delta Net linear attention layer."""
+    def __init__(self, args: ModelArgs, layer_idx: int):
+        super().__init__()
+        self.hidden_size = args.dim
+        self.num_k_heads = args.linear_num_key_heads
+        self.num_v_heads = args.linear_num_value_heads
+        self.head_k_dim = args.linear_key_head_dim
+        self.head_v_dim = args.linear_value_head_dim
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+        self.conv_kernel_size = args.linear_conv_kernel_dim
+        self.layer_idx = layer_idx
+
+        # Combined QKV projection
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
+
+        # Depthwise causal conv on QKV
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False,
+            kernel_size=self.conv_kernel_size, groups=self.conv_dim,
+            padding=self.conv_kernel_size - 1,
+        )
+
+        # Gate projections for delta rule
+        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+
+        # Learnable time-step and decay parameters
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        A = torch.empty(self.num_v_heads).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        # Gated RMSNorm after attention
+        self.norm = RMSNormGated(self.head_v_dim, eps=args.norm_eps)
+
+        # Output projection
+        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor):
+        bsz, seq_len, _ = x.shape
+
+        # QKV projection + causal conv
+        mixed_qkv = self.in_proj_qkv(x).transpose(1, 2)  # (bsz, conv_dim, seq_len)
+        mixed_qkv = torch_causal_conv1d(mixed_qkv, self.conv1d.weight, self.conv1d.bias)
+        mixed_qkv = mixed_qkv.transpose(1, 2)  # (bsz, seq_len, conv_dim)
+
+        query, key, value = torch.split(
+            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        )
+        query = query.reshape(bsz, seq_len, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(bsz, seq_len, self.num_k_heads, self.head_k_dim)
+        value = value.reshape(bsz, seq_len, self.num_v_heads, self.head_v_dim)
+
+        # Gate projections
+        z = self.in_proj_z(x).reshape(bsz, seq_len, self.num_v_heads, self.head_v_dim)
+        beta = self.in_proj_b(x).sigmoid()  # (bsz, seq_len, num_v_heads)
+        a = self.in_proj_a(x)
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+        # Expand K heads to match V heads if needed
+        if self.num_v_heads // self.num_k_heads > 1:
+            rep = self.num_v_heads // self.num_k_heads
+            query = query.repeat_interleave(rep, dim=2)
+            key = key.repeat_interleave(rep, dim=2)
+
+        # L2 norm Q, K before delta rule
+        query = l2norm(query, dim=-1)
+        key = l2norm(key, dim=-1)
+
+        # Gated delta rule recurrence
+        core_out, _ = chunk_gated_delta_rule(
+            query, key, value, g=g, beta=beta,
+            initial_state=None, output_final_state=False,
+        )
+
+        # Gated RMSNorm: norm(attn_out) * SiLU(z)
+        core_out = core_out.reshape(-1, self.head_v_dim)
+        z = z.reshape(-1, self.head_v_dim)
+        core_out = self.norm(core_out, z)
+        core_out = core_out.reshape(bsz, seq_len, -1)
+
+        return self.out_proj(core_out)
 
 
 class FeedForward(nn.Module):
@@ -181,25 +390,32 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(self, layer_id: int, args: ModelArgs, layer_type: str = "full"):
         super().__init__()
-        self.n_heads = args.n_heads
-        self.dim = args.dim
-        self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        self.layer_type = layer_type
+        self.layer_id = layer_id
+
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+
+        if layer_type == "full":
+            self.attention = Attention(args)
+        else:
+            self.attention = LinearAttention(args, layer_idx=layer_id)
+
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=args.hidden_dim,
             multiple_of=args.multiple_of,
             dropout=args.dropout,
         )
-        self.layer_id = layer_id
-        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x, freqs_cos, freqs_sin):
-        h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        if self.layer_type == "full":
+            h = x + self.attention(self.attention_norm(x), freqs_cos, freqs_sin)
+        else:
+            h = x + self.attention(self.attention_norm(x))
+        out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
 
@@ -212,19 +428,31 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
+        # Resolve head_dim
+        head_dim = params.head_dim if params.head_dim is not None else params.dim // params.n_heads
+
+        # Build layer type pattern: default is 3 linear + 1 full, repeating
+        if params.layer_types is not None:
+            layer_types = list(params.layer_types)
+        else:
+            pattern = ("linear", "linear", "linear", "full")
+            layer_types = [pattern[i % len(pattern)] for i in range(params.n_layers)]
+
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+            self.layers.append(TransformerBlock(layer_id, params, layer_type=layer_types[layer_id]))
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         # share the unembedding parameters with the embedding parameters
         self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
 
-        # some useful precompute for the RoPE relative positional embeddings
-        freqs_cos, freqs_sin = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len)
+        # precompute RoPE with partial rotary and configurable theta
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            head_dim, params.max_seq_len,
+            theta=params.rope_base, partial_rotary_factor=params.partial_rotary_factor)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
@@ -232,7 +460,7 @@ class Transformer(nn.Module):
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
-            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight') or pn.endswith('out_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
 
         # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.

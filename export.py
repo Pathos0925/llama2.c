@@ -179,6 +179,92 @@ def version1_export(model, filepath):
     out_file.close()
     print(f"wrote {filepath}")
 
+def version3_export(model, filepath):
+    """
+    Export Qwen3.5 hybrid model weights in float32 .bin file.
+    New format with support for mixed full/linear attention layers.
+    """
+    version = 3
+
+    out_file = open(filepath, 'wb')
+    # 1) magic
+    out_file.write(struct.pack('I', 0x616b3432))
+    # 2) version
+    out_file.write(struct.pack('i', version))
+    # 3) base params: dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq_len
+    p = model.params
+    hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
+    n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
+    head_dim = p.head_dim if p.head_dim is not None else p.dim // p.n_heads
+    header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+                                    n_kv_heads, p.vocab_size, p.max_seq_len)
+    out_file.write(header)
+    # 4) Qwen3.5-specific params
+    out_file.write(struct.pack('i', head_dim))
+    out_file.write(struct.pack('f', p.rope_base))
+    out_file.write(struct.pack('f', p.partial_rotary_factor))
+    out_file.write(struct.pack('f', p.norm_eps))
+    # linear attention params
+    out_file.write(struct.pack('iiiiii',
+        p.linear_num_key_heads, p.linear_num_value_heads,
+        p.linear_key_head_dim, p.linear_value_head_dim,
+        p.linear_conv_kernel_dim, 0))  # last 0 is reserved
+    # 5) shared classifier flag
+    shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
+    out_file.write(struct.pack('B', int(shared_classifier)))
+    # 6) layer types: 0=linear, 1=full
+    for layer in model.layers:
+        out_file.write(struct.pack('B', 1 if layer.layer_type == "full" else 0))
+    # pad header to 512 bytes
+    pad = 512 - out_file.tell()
+    assert pad >= 0, f"Header too large, need {out_file.tell()} bytes"
+    out_file.write(b'\0' * pad)
+
+    # --- Weights ---
+    # Token embeddings
+    serialize_fp32(out_file, model.tok_embeddings.weight)
+
+    # Per-layer weights
+    for layer in model.layers:
+        # attention norm (shared by both types)
+        serialize_fp32(out_file, layer.attention_norm.weight)
+
+        if layer.layer_type == "full":
+            attn = layer.attention
+            serialize_fp32(out_file, attn.wq.weight)
+            serialize_fp32(out_file, attn.wk.weight)
+            serialize_fp32(out_file, attn.wv.weight)
+            serialize_fp32(out_file, attn.wo.weight)
+            # QK norm weights
+            serialize_fp32(out_file, attn.q_norm.weight)
+            serialize_fp32(out_file, attn.k_norm.weight)
+        else:
+            attn = layer.attention
+            serialize_fp32(out_file, attn.in_proj_qkv.weight)
+            serialize_fp32(out_file, attn.in_proj_z.weight)
+            serialize_fp32(out_file, attn.in_proj_b.weight)
+            serialize_fp32(out_file, attn.in_proj_a.weight)
+            serialize_fp32(out_file, attn.conv1d.weight)
+            serialize_fp32(out_file, attn.dt_bias)
+            serialize_fp32(out_file, attn.A_log)
+            serialize_fp32(out_file, attn.norm.weight)
+            serialize_fp32(out_file, attn.out_proj.weight)
+
+        # FFN weights (shared by both types)
+        serialize_fp32(out_file, layer.ffn_norm.weight)
+        serialize_fp32(out_file, layer.feed_forward.w1.weight)
+        serialize_fp32(out_file, layer.feed_forward.w2.weight)
+        serialize_fp32(out_file, layer.feed_forward.w3.weight)
+
+    # Final norm + classifier
+    serialize_fp32(out_file, model.norm.weight)
+    if not shared_classifier:
+        serialize_fp32(out_file, model.output.weight)
+
+    out_file.close()
+    print(f"wrote {filepath}")
+
+
 def version2_export(model, filepath, group_size=64):
     """
     Export the model weights in Q8_0 into .bin file to be read from C.
@@ -504,6 +590,8 @@ def model_export(model, filepath, version, dtype=torch.float32):
         version1_export(model, filepath)
     elif version == 2:
         version2_export(model, filepath)
+    elif version == 3:
+        version3_export(model, filepath)
     elif version == -1:
         hf_export(model, filepath, dtype)
     else:

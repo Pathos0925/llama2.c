@@ -49,13 +49,24 @@ batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch 
 max_seq_len = 256
 vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
 vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
-# model
+# model (Qwen3.5 TinyStories defaults)
 dim = 288
-n_layers = 6
-n_heads = 6
-n_kv_heads = 6
+n_layers = 8
+n_heads = 4
+n_kv_heads = 2
+head_dim = None  # None = dim // n_heads (72 here)
 multiple_of = 32
 dropout = 0.0
+rope_base = 10_000_000.0
+partial_rotary_factor = 0.25
+# layer_types: 3 linear + 1 full, repeating. None = use default pattern.
+layer_types = None
+# linear attention params (scaled down for TinyStories)
+linear_num_key_heads = 4
+linear_num_value_heads = 4
+linear_key_head_dim = 72
+linear_value_head_dim = 72
+linear_conv_kernel_dim = 4
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
@@ -149,10 +160,19 @@ model_args = dict(
     n_layers=n_layers,
     n_heads=n_heads,
     n_kv_heads=n_kv_heads,
+    head_dim=head_dim,
     vocab_size=vocab_size,
     multiple_of=multiple_of,
     max_seq_len=max_seq_len,
     dropout=dropout,
+    rope_base=rope_base,
+    partial_rotary_factor=partial_rotary_factor,
+    layer_types=layer_types,
+    linear_num_key_heads=linear_num_key_heads,
+    linear_num_value_heads=linear_num_value_heads,
+    linear_key_head_dim=linear_key_head_dim,
+    linear_value_head_dim=linear_value_head_dim,
+    linear_conv_kernel_dim=linear_conv_kernel_dim,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -167,7 +187,10 @@ elif init_from == "resume":
     checkpoint_model_args = checkpoint["model_args"]
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
+    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "head_dim", "vocab_size",
+               "multiple_of", "max_seq_len", "rope_base", "partial_rotary_factor",
+               "layer_types", "linear_num_key_heads", "linear_num_value_heads",
+               "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim"]:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = ModelArgs(**model_args)
@@ -288,7 +311,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
-                model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)
+                model_export(raw_model, os.path.join(out_dir, "model.bin"), version=3)
     if iter_num == 0 and eval_only:
         break
 
