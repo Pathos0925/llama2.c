@@ -106,3 +106,5 @@ data/TinyStories_all_data/data49.json
 stories15M.bin
 run
 runq
+out/ckpt.pt
+out/model.bin
