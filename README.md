@@ -1,18 +1,36 @@
 ## llama2.c (Qwen3.5 architecture)
 
-> **Architecture update:** The Python training code (`model.py`) has been migrated from the original Llama 2 architecture to **Qwen3.5**. The C inference code (`run.c`, `runq.c`) has not yet been updated and will not work with the new model format. See [Architecture changes](#architecture-changes) below.
+> **Architecture update:** This fork has been migrated from the original Llama 2 architecture to **Qwen3.5**. Both Python training and C inference (fp32 + int8 quantized) are fully working. See [Architecture changes](#architecture-changes) below.
 
 <p align="center">
   <img src="assets/llama_cute.jpg" width="300" height="300" alt="Cute Llama">
 </p>
 
-Have you ever wanted to inference a baby [Llama 2](https://ai.meta.com/llama/) model in pure C? No? Well, now you can!
+Train a Qwen3.5 hybrid-attention LLM in PyTorch, then inference it in pure C. Based on Karpathy's [llama2.c](https://github.com/karpathy/llama2.c), updated with the Qwen3.5 architecture: hybrid linear/full attention layers, gated Q projections, partial RoPE, and Gated Delta Net linear attention.
 
-Train the Llama 2 LLM architecture in PyTorch then inference it with one simple 700-line C file ([run.c](run.c)). You might think that you need many billion parameter LLMs to do anything useful, but in fact very small LLMs can have surprisingly strong performance if you make the domain narrow enough (ref: [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) paper). This repo is a "fullstack" train + inference solution for Llama 2 LLM, with focus on minimalism and simplicity.
+Small LLMs can have surprisingly strong performance if you make the domain narrow enough (ref: [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) paper). This repo is a "fullstack" train + inference solution with focus on minimalism and simplicity.
 
-As the architecture is identical, you can also load and inference Meta's Llama 2 models. However, the current code only inferences models in fp32, so you will most likely not be able to productively load models larger than 7B. Work on model quantization is currently ongoing.
+### quick start
 
-Please note that this repo started recently as a fun weekend project: I took my earlier [nanoGPT](https://github.com/karpathy/nanoGPT), tuned it to implement the Llama-2 architecture instead of GPT-2, and the meat of it was writing the C inference engine in [run.c](run.c). So the project is young and moving quickly. Hat tip to the awesome [llama.cpp](https://github.com/ggerganov/llama.cpp) for inspiring this project. Compared to llama.cpp, I wanted something super simple, minimal, and educational so I chose to hard-code the Llama 2 architecture and just roll one inference file of pure C with no dependencies.
+```bash
+# Train a model
+python tinystories.py download
+python tinystories.py pretokenize
+python train.py config/qwen3_suggested.py
+
+# Export and run in C (fp32)
+python export.py out/model.bin --version 3 --checkpoint out/ckpt.pt
+gcc -O2 -o run run.c -lm
+./run out/model.bin -i "Once upon a time" -n 256
+
+# Or quantized (int8, ~3.4x smaller, ~25% faster)
+python export.py out/model_q8.bin --version 4 --checkpoint out/ckpt.pt
+gcc -O2 -o runq runq.c -lm
+./runq out/model_q8.bin -i "Once upon a time" -n 256
+
+# Python inference (for testing/comparison)
+python inference.py --checkpoint out/ckpt.pt --prompt "Once upon a time"
+```
 
 ## feel the magic
 
@@ -160,7 +178,7 @@ You'll notice that the 110M model is equivalent to GPT-1 in size. Alternatively,
 
 ## architecture changes
 
-The model architecture in `model.py` has been updated from Llama 2 to Qwen3.5. Key differences:
+The model architecture has been updated from Llama 2 to Qwen3.5. Key differences:
 
 | Feature | Llama 2 (original) | Qwen3.5 (current) |
 |---------|--------------------|--------------------|
@@ -173,9 +191,27 @@ The model architecture in `model.py` has been updated from Llama 2 to Qwen3.5. K
 
 The hybrid attention design alternates between lightweight linear attention layers (Gated Delta Net) and full softmax attention layers. Linear attention layers use a delta rule recurrence instead of the quadratic attention matrix, making them more efficient for long sequences.
 
-**Export format:** A new version 3 binary format (`export.py --version 3`) serializes the hybrid architecture. Older v0/v1/v2 formats are incompatible with the new model.
+### export formats
 
-**C inference:** `run.c` and `runq.c` have not yet been updated for Qwen3.5. This is planned for a future update.
+| Version | Format | Command | C binary |
+|---------|--------|---------|----------|
+| v3 | fp32 | `python export.py out/model.bin --version 3 --checkpoint out/ckpt.pt` | `run` |
+| v4 | int8 Q8_0 | `python export.py out/model_q8.bin --version 4 --checkpoint out/ckpt.pt` | `runq` |
+
+The v4 quantized format is ~3.4x smaller and ~25% faster than v3 fp32, with minimal quality loss. Large projection matrices are quantized to int8; small parameters (norms, conv weights, scalar params) stay fp32.
+
+Older v0/v1/v2 formats from the original llama2.c are incompatible with the new Qwen3.5 model.
+
+### config files
+
+Training configs live in the `config/` directory:
+
+```bash
+python train.py config/qwen3_original.py     # original defaults
+python train.py config/qwen3_suggested.py     # tuned hyperparameters (recommended)
+```
+
+You can also override individual params: `python train.py config/qwen3_suggested.py --max_iters=50000`
 
 ## training
 
