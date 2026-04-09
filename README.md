@@ -1,4 +1,6 @@
-## llama2.c
+## llama2.c (Qwen3.5 architecture)
+
+> **Architecture update:** The Python training code (`model.py`) has been migrated from the original Llama 2 architecture to **Qwen3.5**. The C inference code (`run.c`, `runq.c`) has not yet been updated and will not work with the new model format. See [Architecture changes](#architecture-changes) below.
 
 <p align="center">
   <img src="assets/llama_cute.jpg" width="300" height="300" alt="Cute Llama">
@@ -155,6 +157,25 @@ For the sake of examples of smaller, from-scratch models, I trained a small mode
 | 110M| 768 | 12 | 12 | 12 | 1024 | 110M | 0.760 | [stories110M.bin](https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.bin) |
 
 You'll notice that the 110M model is equivalent to GPT-1 in size. Alternatively, this is also the smallest model in the GPT-2 series (`GPT-2 small`), except the max context length is only 1024 instead of 2048. The only notable changes from GPT-1/2 architecture is that Llama uses RoPE relatively positional embeddings instead of absolute/learned positional embeddings, a bit more fancy SwiGLU non-linearity in the MLP, RMSNorm instead of LayerNorm, bias=False on all Linear layers, and is optionally multiquery.
+
+## architecture changes
+
+The model architecture in `model.py` has been updated from Llama 2 to Qwen3.5. Key differences:
+
+| Feature | Llama 2 (original) | Qwen3.5 (current) |
+|---------|--------------------|--------------------|
+| **Normalization** | RMSNorm, weight init=1 | RMSNorm, zero-init weight, `x * (1 + weight)` |
+| **RoPE** | Full head_dim, theta=10K | Partial rotary (25%), theta=10M |
+| **Full attention** | Standard Q projection | Gated Q (2x width + sigmoid gate), QK norm |
+| **Linear attention** | N/A | Gated Delta Net with causal depthwise conv |
+| **Layer pattern** | All identical | Hybrid: 3 linear + 1 full attention, repeating |
+| **FFN** | SwiGLU | SwiGLU (unchanged) |
+
+The hybrid attention design alternates between lightweight linear attention layers (Gated Delta Net) and full softmax attention layers. Linear attention layers use a delta rule recurrence instead of the quadratic attention matrix, making them more efficient for long sequences.
+
+**Export format:** A new version 3 binary format (`export.py --version 3`) serializes the hybrid architecture. Older v0/v1/v2 formats are incompatible with the new model.
+
+**C inference:** `run.c` and `runq.c` have not yet been updated for Qwen3.5. This is planned for a future update.
 
 ## training
 
