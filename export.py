@@ -265,6 +265,105 @@ def version3_export(model, filepath):
     print(f"wrote {filepath}")
 
 
+def version4_export(model, filepath, group_size=64):
+    """
+    Export Qwen3.5 hybrid model weights in Q8_0 quantized format.
+    Large projection matrices are quantized to int8; small params (norms, conv,
+    dt_bias, A_log) stay fp32.
+    """
+    version = 4
+
+    p = model.params
+    hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
+    n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
+    head_dim = p.head_dim if p.head_dim is not None else p.dim // p.n_heads
+    shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
+
+    # adjust group_size to fit dim
+    while p.dim % group_size != 0:
+        group_size //= 2
+        print(f"BACKOFF: reducing group size to {group_size} to fit hidden_dim")
+
+    def serialize_q80(file, tensor):
+        """Quantize and write int8 values + fp32 scale factors."""
+        q, s, err = quantize_q80(tensor, group_size)
+        serialize_int8(file, q)
+        serialize_fp32(file, s)
+        return err
+
+    # --- Header (512 bytes, same layout as v3 + group_size) ---
+    out_file = open(filepath, 'wb')
+    out_file.write(struct.pack('I', 0x616b3432))  # magic
+    out_file.write(struct.pack('i', version))       # version=4
+    out_file.write(struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+                                          n_kv_heads, p.vocab_size, p.max_seq_len))
+    out_file.write(struct.pack('i', head_dim))
+    out_file.write(struct.pack('f', p.rope_base))
+    out_file.write(struct.pack('f', p.partial_rotary_factor))
+    out_file.write(struct.pack('f', p.norm_eps))
+    out_file.write(struct.pack('iiiiii',
+        p.linear_num_key_heads, p.linear_num_value_heads,
+        p.linear_key_head_dim, p.linear_value_head_dim,
+        p.linear_conv_kernel_dim, 0))
+    out_file.write(struct.pack('B', int(shared_classifier)))
+    for layer in model.layers:
+        out_file.write(struct.pack('B', 1 if layer.layer_type == "full" else 0))
+    out_file.write(struct.pack('i', group_size))  # group size for quantization
+    pad = 512 - out_file.tell()
+    assert pad >= 0, f"Header too large, need {out_file.tell()} bytes"
+    out_file.write(b'\0' * pad)
+
+    # --- Weights (per-layer, matching v3 order, large matrices quantized) ---
+    # Token embeddings (quantized)
+    err = serialize_q80(out_file, model.tok_embeddings.weight)
+    print(f"token_embedding quantized with max error {err}")
+
+    for i, layer in enumerate(model.layers):
+        # attention norm (fp32)
+        serialize_fp32(out_file, layer.attention_norm.weight)
+
+        if layer.layer_type == "full":
+            attn = layer.attention
+            # large projections: quantized
+            serialize_q80(out_file, attn.wq.weight)
+            serialize_q80(out_file, attn.wk.weight)
+            serialize_q80(out_file, attn.wv.weight)
+            serialize_q80(out_file, attn.wo.weight)
+            # QK norm weights (fp32, small)
+            serialize_fp32(out_file, attn.q_norm.weight)
+            serialize_fp32(out_file, attn.k_norm.weight)
+        else:
+            attn = layer.attention
+            # large projections: quantized
+            serialize_q80(out_file, attn.in_proj_qkv.weight)
+            serialize_q80(out_file, attn.in_proj_z.weight)
+            serialize_q80(out_file, attn.in_proj_b.weight)
+            serialize_q80(out_file, attn.in_proj_a.weight)
+            # small params: fp32
+            serialize_fp32(out_file, attn.conv1d.weight)
+            serialize_fp32(out_file, attn.dt_bias)
+            serialize_fp32(out_file, attn.A_log)
+            serialize_fp32(out_file, attn.norm.weight)
+            # output projection: quantized
+            serialize_q80(out_file, attn.out_proj.weight)
+
+        # FFN norm (fp32)
+        serialize_fp32(out_file, layer.ffn_norm.weight)
+        # FFN projections (quantized)
+        serialize_q80(out_file, layer.feed_forward.w1.weight)
+        serialize_q80(out_file, layer.feed_forward.w2.weight)
+        serialize_q80(out_file, layer.feed_forward.w3.weight)
+        print(f"  layer {i+1}/{p.n_layers} done")
+
+    # Final norm (fp32) + classifier (quantized if not shared)
+    serialize_fp32(out_file, model.norm.weight)
+    if not shared_classifier:
+        serialize_q80(out_file, model.output.weight)
+
+    out_file.close()
+    print(f"wrote {filepath}")
+
+
 def version2_export(model, filepath, group_size=64):
     """
     Export the model weights in Q8_0 into .bin file to be read from C.
@@ -592,6 +691,8 @@ def model_export(model, filepath, version, dtype=torch.float32):
         version2_export(model, filepath)
     elif version == 3:
         version3_export(model, filepath)
+    elif version == 4:
+        version4_export(model, filepath)
     elif version == -1:
         hf_export(model, filepath, dtype)
     else:
