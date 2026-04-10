@@ -17,6 +17,7 @@ linear_num_value_heads = 4
 linear_key_head_dim = 72
 linear_value_head_dim = 72
 linear_conv_kernel_dim = 4
+attnres_block_size = 0  # disabled
 
 # data
 batch_size = 64

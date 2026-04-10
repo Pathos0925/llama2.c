@@ -67,6 +67,8 @@ linear_num_value_heads = 4
 linear_key_head_dim = 72
 linear_value_head_dim = 72
 linear_conv_kernel_dim = 4
+# attention residuals: 0 = disabled, >0 = block_size (sub-layers per block)
+attnres_block_size = 0
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
@@ -173,6 +175,7 @@ model_args = dict(
     linear_key_head_dim=linear_key_head_dim,
     linear_value_head_dim=linear_value_head_dim,
     linear_conv_kernel_dim=linear_conv_kernel_dim,
+    attnres_block_size=attnres_block_size,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -190,7 +193,8 @@ elif init_from == "resume":
     for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "head_dim", "vocab_size",
                "multiple_of", "max_seq_len", "rope_base", "partial_rotary_factor",
                "layer_types", "linear_num_key_heads", "linear_num_value_heads",
-               "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim"]:
+               "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim",
+               "attnres_block_size"]:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = ModelArgs(**model_args)

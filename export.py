@@ -205,10 +205,11 @@ def version3_export(model, filepath):
     out_file.write(struct.pack('f', p.partial_rotary_factor))
     out_file.write(struct.pack('f', p.norm_eps))
     # linear attention params
+    attnres_block_size = p.attnres_block_size if hasattr(p, 'attnres_block_size') else 0
     out_file.write(struct.pack('iiiiii',
         p.linear_num_key_heads, p.linear_num_value_heads,
         p.linear_key_head_dim, p.linear_value_head_dim,
-        p.linear_conv_kernel_dim, 0))  # last 0 is reserved
+        p.linear_conv_kernel_dim, attnres_block_size))
     # 5) shared classifier flag
     shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
     out_file.write(struct.pack('B', int(shared_classifier)))
@@ -250,6 +251,13 @@ def version3_export(model, filepath):
             serialize_fp32(out_file, attn.norm.weight)
             serialize_fp32(out_file, attn.out_proj.weight)
 
+        # AttnRes weights (if enabled)
+        if attnres_block_size > 0:
+            serialize_fp32(out_file, layer.attn_res.proj.weight)
+            serialize_fp32(out_file, layer.attn_res.norm.weight)
+            serialize_fp32(out_file, layer.mlp_res.proj.weight)
+            serialize_fp32(out_file, layer.mlp_res.norm.weight)
+
         # FFN weights (shared by both types)
         serialize_fp32(out_file, layer.ffn_norm.weight)
         serialize_fp32(out_file, layer.feed_forward.w1.weight)
@@ -279,6 +287,8 @@ def version4_export(model, filepath, group_size=64):
     head_dim = p.head_dim if p.head_dim is not None else p.dim // p.n_heads
     shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
 
+    attnres_block_size = p.attnres_block_size if hasattr(p, 'attnres_block_size') else 0
+
     # adjust group_size to fit dim
     while p.dim % group_size != 0:
         group_size //= 2
@@ -304,7 +314,7 @@ def version4_export(model, filepath, group_size=64):
     out_file.write(struct.pack('iiiiii',
         p.linear_num_key_heads, p.linear_num_value_heads,
         p.linear_key_head_dim, p.linear_value_head_dim,
-        p.linear_conv_kernel_dim, 0))
+        p.linear_conv_kernel_dim, attnres_block_size))
     out_file.write(struct.pack('B', int(shared_classifier)))
     for layer in model.layers:
         out_file.write(struct.pack('B', 1 if layer.layer_type == "full" else 0))
@@ -324,28 +334,30 @@ def version4_export(model, filepath, group_size=64):
 
         if layer.layer_type == "full":
             attn = layer.attention
-            # large projections: quantized
             serialize_q80(out_file, attn.wq.weight)
             serialize_q80(out_file, attn.wk.weight)
             serialize_q80(out_file, attn.wv.weight)
             serialize_q80(out_file, attn.wo.weight)
-            # QK norm weights (fp32, small)
             serialize_fp32(out_file, attn.q_norm.weight)
             serialize_fp32(out_file, attn.k_norm.weight)
         else:
             attn = layer.attention
-            # large projections: quantized
             serialize_q80(out_file, attn.in_proj_qkv.weight)
             serialize_q80(out_file, attn.in_proj_z.weight)
             serialize_q80(out_file, attn.in_proj_b.weight)
             serialize_q80(out_file, attn.in_proj_a.weight)
-            # small params: fp32
             serialize_fp32(out_file, attn.conv1d.weight)
             serialize_fp32(out_file, attn.dt_bias)
             serialize_fp32(out_file, attn.A_log)
             serialize_fp32(out_file, attn.norm.weight)
-            # output projection: quantized
             serialize_q80(out_file, attn.out_proj.weight)
+
+        # AttnRes weights (fp32, small)
+        if attnres_block_size > 0:
+            serialize_fp32(out_file, layer.attn_res.proj.weight)
+            serialize_fp32(out_file, layer.attn_res.norm.weight)
+            serialize_fp32(out_file, layer.mlp_res.proj.weight)
+            serialize_fp32(out_file, layer.mlp_res.norm.weight)
 
         # FFN norm (fp32)
         serialize_fp32(out_file, layer.ffn_norm.weight)

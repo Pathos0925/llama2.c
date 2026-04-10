@@ -35,6 +35,7 @@ typedef struct {
     int linear_key_head_dim;
     int linear_value_head_dim;
     int linear_conv_kernel_dim;
+    int attnres_block_size;  // 0 = disabled
     // flags
     int shared_weights;
     unsigned char* layer_types; // 0=linear, 1=full, length n_layers
@@ -63,6 +64,11 @@ typedef struct {
     float** A_log;                // [layer] -> (num_v_heads,)
     float** gated_norm_weight;    // [layer] -> (value_head_dim,)
     float** out_proj;             // [layer] -> (value_dim, dim)
+    // Block AttnRes weights (NULL if disabled)
+    float** attn_res_proj;    // [layer] -> (dim,)
+    float** attn_res_norm;    // [layer] -> (dim,)
+    float** mlp_res_proj;     // [layer] -> (dim,)
+    float** mlp_res_norm;     // [layer] -> (dim,)
     // FFN weights (all layers)
     float** rms_ffn_weight;       // [layer] -> (dim,)
     float** w1;                   // [layer] -> (hidden_dim, dim)
@@ -97,6 +103,12 @@ typedef struct {
     // linear attention persistent state
     float **conv_state;       // [lin_layer_idx] -> (conv_dim, kernel_size - 1)
     float **recurrent_state;  // [lin_layer_idx] -> (num_v_heads, key_head_dim, value_head_dim)
+    // block attnres state (single-token inference: each block rep is dim floats)
+    float **block_reps;       // array of block representation vectors (dim,)
+    int n_blocks;             // current number of completed blocks
+    int max_blocks;           // max blocks allocated
+    float *partial_block;     // (dim,) current partial block sum
+    float *attnres_out;       // (dim,) scratch for attnres output
 } RunState;
 
 typedef struct {
@@ -126,6 +138,10 @@ static void alloc_layer_pointers(TransformerWeights *w, int n_layers) {
     w->A_log = calloc(n_layers, sizeof(float*));
     w->gated_norm_weight = calloc(n_layers, sizeof(float*));
     w->out_proj = calloc(n_layers, sizeof(float*));
+    w->attn_res_proj = calloc(n_layers, sizeof(float*));
+    w->attn_res_norm = calloc(n_layers, sizeof(float*));
+    w->mlp_res_proj = calloc(n_layers, sizeof(float*));
+    w->mlp_res_norm = calloc(n_layers, sizeof(float*));
     w->rms_ffn_weight = calloc(n_layers, sizeof(float*));
     w->w1 = calloc(n_layers, sizeof(float*));
     w->w2 = calloc(n_layers, sizeof(float*));
@@ -180,6 +196,21 @@ void malloc_run_state(RunState* s, Config* p) {
         s->conv_state = NULL; s->recurrent_state = NULL;
     }
 
+    // Block AttnRes state
+    if (p->attnres_block_size > 0) {
+        // max blocks = n_layers * 2 / block_size + 2 (generous upper bound)
+        s->max_blocks = (p->n_layers * 2) / p->attnres_block_size + 2;
+        s->block_reps = calloc(s->max_blocks, sizeof(float*));
+        for (int i = 0; i < s->max_blocks; i++)
+            s->block_reps[i] = calloc(p->dim, sizeof(float));
+        s->partial_block = calloc(p->dim, sizeof(float));
+        s->attnres_out = calloc(p->dim, sizeof(float));
+        s->n_blocks = 0;
+    } else {
+        s->block_reps = NULL; s->partial_block = NULL;
+        s->attnres_out = NULL; s->max_blocks = 0; s->n_blocks = 0;
+    }
+
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->logits) {
         fprintf(stderr, "malloc failed!\n");
@@ -203,6 +234,11 @@ void free_run_state(RunState* s, Config* p) {
         free(s->conv_state);
         free(s->recurrent_state);
     }
+    if (s->block_reps) {
+        for (int i = 0; i < s->max_blocks; i++) free(s->block_reps[i]);
+        free(s->block_reps);
+    }
+    free(s->partial_block); free(s->attnres_out);
 }
 
 void memory_map_weights(TransformerWeights *w, Config* p, float* ptr) {
@@ -237,6 +273,14 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr) {
             w->A_log[l] = ptr;             ptr += p->linear_num_value_heads;
             w->gated_norm_weight[l] = ptr; ptr += p->linear_value_head_dim;
             w->out_proj[l] = ptr;          ptr += value_dim * p->dim;
+        }
+
+        // AttnRes weights (if enabled)
+        if (p->attnres_block_size > 0) {
+            w->attn_res_proj[l] = ptr; ptr += p->dim;
+            w->attn_res_norm[l] = ptr; ptr += p->dim;
+            w->mlp_res_proj[l] = ptr;  ptr += p->dim;
+            w->mlp_res_norm[l] = ptr;  ptr += p->dim;
         }
 
         // FFN
@@ -284,6 +328,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
         config->linear_key_head_dim = linear_params[2];
         config->linear_value_head_dim = linear_params[3];
         config->linear_conv_kernel_dim = linear_params[4];
+        config->attnres_block_size = linear_params[5];
         // shared classifier flag
         unsigned char shared_flag;
         if (fread(&shared_flag, sizeof(unsigned char), 1, file) != 1) exit(EXIT_FAILURE);
@@ -314,6 +359,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
         config->linear_key_head_dim = 0;
         config->linear_value_head_dim = 0;
         config->linear_conv_kernel_dim = 0;
+        config->attnres_block_size = 0;
     }
 
     // count layer types
@@ -364,6 +410,8 @@ void free_transformer(Transformer* t) {
     free(w->in_proj_qkv); free(w->in_proj_z); free(w->in_proj_b); free(w->in_proj_a);
     free(w->conv_weight); free(w->dt_bias); free(w->A_log);
     free(w->gated_norm_weight); free(w->out_proj);
+    free(w->attn_res_proj); free(w->attn_res_norm);
+    free(w->mlp_res_proj); free(w->mlp_res_norm);
     free(w->rms_ffn_weight); free(w->w1); free(w->w2); free(w->w3);
 }
 
@@ -443,6 +491,43 @@ void reset_linear_state(RunState* s, Config* p) {
     }
 }
 
+void block_attn_res(float* out, float** block_reps, int n_blocks,
+                    float* partial_block, float* proj_weight,
+                    float* norm_weight, int dim, float eps) {
+    // Attend over (n_blocks completed blocks + 1 partial) to produce output
+    int total = n_blocks + 1;
+    float logits[64]; // max blocks (generous)
+
+    for (int n = 0; n < total; n++) {
+        float* v = (n < n_blocks) ? block_reps[n] : partial_block;
+        // RMSNorm the value, then dot with proj_weight
+        float ss = 0.0f;
+        for (int j = 0; j < dim; j++) ss += v[j] * v[j];
+        ss = 1.0f / sqrtf(ss / dim + eps);
+        float dot = 0.0f;
+        for (int j = 0; j < dim; j++) {
+            float normed = (1.0f + norm_weight[j]) * (ss * v[j]);
+            dot += proj_weight[j] * normed;
+        }
+        logits[n] = dot;
+    }
+
+    // softmax over block dimension
+    float max_val = logits[0];
+    for (int n = 1; n < total; n++) if (logits[n] > max_val) max_val = logits[n];
+    float sum = 0.0f;
+    for (int n = 0; n < total; n++) { logits[n] = expf(logits[n] - max_val); sum += logits[n]; }
+    for (int n = 0; n < total; n++) logits[n] /= sum;
+
+    // weighted sum
+    memset(out, 0, dim * sizeof(float));
+    for (int n = 0; n < total; n++) {
+        float* v = (n < n_blocks) ? block_reps[n] : partial_block;
+        float w = logits[n];
+        for (int j = 0; j < dim; j++) out[j] += w * v[j];
+    }
+}
+
 float* forward(Transformer* transformer, int token, int pos) {
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
@@ -470,13 +555,43 @@ float* forward(Transformer* transformer, int token, int pos) {
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim * sizeof(float));
 
+    // Initialize block attnres state: token embedding is first block and partial
+    int use_attnres = p->attnres_block_size > 0;
+    if (use_attnres) {
+        memcpy(s->block_reps[0], x, dim * sizeof(float));
+        s->n_blocks = 1;
+        memcpy(s->partial_block, x, dim * sizeof(float));
+    }
+
     int full_idx = 0;   // index into full attention KV cache layers
     int lin_idx = 0;     // index into linear attention state layers
 
     for (int l = 0; l < p->n_layers; l++) {
 
-        // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight[l], dim, eps);
+        if (use_attnres) {
+            int sublayer_idx = l * 2;
+            int is_boundary = (sublayer_idx > 0 && sublayer_idx % p->attnres_block_size == 0);
+
+            if (is_boundary) {
+                // snapshot partial_block as new completed block
+                memcpy(s->block_reps[s->n_blocks], s->partial_block, dim * sizeof(float));
+                s->n_blocks++;
+                // attend over all completed blocks (partial = last completed)
+                block_attn_res(s->xb, s->block_reps, s->n_blocks,
+                               s->block_reps[s->n_blocks - 1],
+                               w->attn_res_proj[l], w->attn_res_norm[l], dim, eps);
+            } else {
+                // attend over completed blocks + current partial
+                block_attn_res(s->xb, s->block_reps, s->n_blocks,
+                               s->partial_block,
+                               w->attn_res_proj[l], w->attn_res_norm[l], dim, eps);
+            }
+            // xb now has the attnres output; use it as input to attention norm
+            rmsnorm(s->xb, s->xb, w->rms_att_weight[l], dim, eps);
+        } else {
+            // standard path: just norm the running hidden state
+            rmsnorm(s->xb, x, w->rms_att_weight[l], dim, eps);
+        }
 
         if (p->layer_types[l] == 1) {
             // ==================== FULL ATTENTION ====================
@@ -710,11 +825,30 @@ float* forward(Transformer* transformer, int token, int pos) {
             lin_idx++;
         }
 
-        // residual connection
-        for (int i = 0; i < dim; i++) { x[i] += s->xb2[i]; }
+        if (use_attnres) {
+            // attn residual: accumulate into partial_block
+            int sublayer_idx = l * 2;
+            int is_boundary = (sublayer_idx > 0 && sublayer_idx % p->attnres_block_size == 0);
+            if (is_boundary) {
+                // partial_block was reset; start fresh from attn output
+                memcpy(s->partial_block, s->xb2, dim * sizeof(float));
+            } else {
+                for (int i = 0; i < dim; i++) s->partial_block[i] += s->xb2[i];
+            }
+
+            // Before MLP: attend over depth again
+            block_attn_res(s->xb, s->block_reps, s->n_blocks,
+                           s->partial_block,
+                           w->mlp_res_proj[l], w->mlp_res_norm[l], dim, eps);
+            // FFN with attnres input
+            rmsnorm(s->xb, s->xb, w->rms_ffn_weight[l], dim, eps);
+        } else {
+            // standard residual
+            for (int i = 0; i < dim; i++) { x[i] += s->xb2[i]; }
+            rmsnorm(s->xb, x, w->rms_ffn_weight[l], dim, eps);
+        }
 
         // FFN
-        rmsnorm(s->xb, x, w->rms_ffn_weight[l], dim, eps);
         matmul(s->hb, s->xb, w->w1[l], dim, hidden_dim);
         matmul(s->hb2, s->xb, w->w3[l], dim, hidden_dim);
         // SwiGLU
@@ -725,11 +859,20 @@ float* forward(Transformer* transformer, int token, int pos) {
             s->hb[i] = val;
         }
         matmul(s->xb, s->hb, w->w2[l], hidden_dim, dim);
-        for (int i = 0; i < dim; i++) { x[i] += s->xb[i]; }
+
+        if (use_attnres) {
+            for (int i = 0; i < dim; i++) s->partial_block[i] += s->xb[i];
+        } else {
+            for (int i = 0; i < dim; i++) { x[i] += s->xb[i]; }
+        }
     }
 
     // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim, eps);
+    if (use_attnres) {
+        rmsnorm(x, s->partial_block, w->rms_final_weight, dim, eps);
+    } else {
+        rmsnorm(x, x, w->rms_final_weight, dim, eps);
+    }
 
     // classifier into logits
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);

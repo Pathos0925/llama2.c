@@ -32,6 +32,9 @@ class ModelArgs:
     linear_key_head_dim: int = 128
     linear_value_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
+    # Block Attention Residuals: 0 = disabled (standard residuals)
+    # block_size counts sub-layers (attn+mlp = 2 per transformer layer)
+    attnres_block_size: int = 0
 
 
 class RMSNorm(torch.nn.Module):
@@ -63,6 +66,23 @@ class RMSNormGated(torch.nn.Module):
         x = self.weight * x.to(input_dtype)
         x = x * F.silu(gate.to(torch.float32))
         return x.to(input_dtype)
+
+
+class BlockAttnRes(nn.Module):
+    """Block Attention Residual: softmax attention over block-level representations."""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.proj = nn.Linear(dim, 1, bias=False)
+        self.norm = RMSNorm(dim, eps=eps)
+
+    def forward(self, blocks: list, partial_block: torch.Tensor) -> torch.Tensor:
+        # blocks: list of [B, T, D], partial_block: [B, T, D]
+        V = torch.stack(blocks + [partial_block])  # [N+1, B, T, D]
+        K = self.norm(V)
+        logits = torch.einsum('d, n b t d -> n b t', self.proj.weight.squeeze(), K)
+        weights = torch.softmax(logits, dim=0)
+        h = torch.einsum('n b t, n b t d -> b t d', weights, V)
+        return h
 
 
 def precompute_freqs_cis(head_dim: int, end: int, theta: float = 10_000_000.0, partial_rotary_factor: float = 0.25):
@@ -394,6 +414,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.layer_type = layer_type
         self.layer_id = layer_id
+        self.attnres_block_size = args.attnres_block_size
 
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
@@ -410,13 +431,51 @@ class TransformerBlock(nn.Module):
         )
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, freqs_cos, freqs_sin):
-        if self.layer_type == "full":
-            h = x + self.attention(self.attention_norm(x), freqs_cos, freqs_sin)
+        if args.attnres_block_size > 0:
+            self.attn_res = BlockAttnRes(args.dim, eps=args.norm_eps)
+            self.mlp_res = BlockAttnRes(args.dim, eps=args.norm_eps)
+
+    def forward(self, blocks, partial_block, freqs_cos, freqs_sin):
+        if self.attnres_block_size > 0:
+            # Block boundary: snapshot partial_block and start fresh
+            sublayer_idx = self.layer_id * 2
+            if sublayer_idx > 0 and sublayer_idx % self.attnres_block_size == 0:
+                blocks = blocks + [partial_block]
+                # Attend over completed blocks to produce input for attention
+                # (partial_block is the last completed block, already in blocks)
+                h = self.attn_res(blocks, blocks[-1])
+            else:
+                # Before attention: attend over blocks + current partial
+                h = self.attn_res(blocks, partial_block)
+
+            # Attention sub-layer
+            if self.layer_type == "full":
+                attn_out = self.attention(self.attention_norm(h), freqs_cos, freqs_sin)
+            else:
+                attn_out = self.attention(self.attention_norm(h))
+
+            # Start new partial_block at boundary, or accumulate
+            if sublayer_idx > 0 and sublayer_idx % self.attnres_block_size == 0:
+                partial_block = attn_out
+            else:
+                partial_block = partial_block + attn_out
+
+            # Before MLP: attend over depth again
+            h = self.mlp_res(blocks, partial_block)
+
+            # MLP sub-layer
+            mlp_out = self.feed_forward(self.ffn_norm(h))
+            partial_block = partial_block + mlp_out
+
+            return blocks, partial_block
         else:
-            h = x + self.attention(self.attention_norm(x))
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+            # Standard residual path (attnres disabled)
+            if self.layer_type == "full":
+                h = partial_block + self.attention(self.attention_norm(partial_block), freqs_cos, freqs_sin)
+            else:
+                h = partial_block + self.attention(self.attention_norm(partial_block))
+            out = h + self.feed_forward(self.ffn_norm(h))
+            return blocks, out
 
 
 class Transformer(nn.Module):
@@ -481,9 +540,13 @@ class Transformer(nn.Module):
         freqs_cos = self.freqs_cos[:seqlen]
         freqs_sin = self.freqs_sin[:seqlen]
 
+        # Token embedding is the first "block" and the initial partial sum
+        blocks = [h]
+        partial_block = h
+
         for layer in self.layers:
-            h = layer(h, freqs_cos, freqs_sin)
-        h = self.norm(h)
+            blocks, partial_block = layer(blocks, partial_block, freqs_cos, freqs_sin)
+        h = self.norm(partial_block)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss

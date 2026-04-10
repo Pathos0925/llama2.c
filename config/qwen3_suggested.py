@@ -24,6 +24,7 @@ linear_num_value_heads = 4
 linear_key_head_dim = 144           # was 72 -- linear layers need more capacity (2x head_dim)
 linear_value_head_dim = 144         # was 72
 linear_conv_kernel_dim = 4
+attnres_block_size = 4              # block attention residuals (4 sub-layers per block = 2 layers)
 
 # data
 batch_size = 64

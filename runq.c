@@ -38,6 +38,7 @@ typedef struct {
     int linear_key_head_dim;
     int linear_value_head_dim;
     int linear_conv_kernel_dim;
+    int attnres_block_size;
     int shared_weights;
     unsigned char* layer_types;
     int n_full_layers;
@@ -61,6 +62,12 @@ typedef struct {
     float** dt_bias;
     float** A_log;
     float** gated_norm_weight;
+    // Block AttnRes weights (fp32, NULL if disabled)
+    float** attn_res_proj;
+    float** attn_res_norm;
+    float** mlp_res_proj;
+    float** mlp_res_norm;
+
     float** rms_ffn_weight;
     float* rms_final_weight;
 
@@ -102,6 +109,11 @@ typedef struct {
     // linear attention
     float *lin_qkv, *lin_z, *lin_b, *lin_a, *lin_out;
     float **conv_state, **recurrent_state;
+    // block attnres state
+    float **block_reps;
+    int n_blocks, max_blocks;
+    float *partial_block;
+    float *attnres_out;
 } RunState;
 
 typedef struct {
@@ -206,6 +218,18 @@ void malloc_run_state(RunState* s, Config* p) {
         s->conv_state = NULL; s->recurrent_state = NULL;
     }
 
+    if (p->attnres_block_size > 0) {
+        s->max_blocks = (p->n_layers * 2) / p->attnres_block_size + 2;
+        s->block_reps = calloc(s->max_blocks, sizeof(float*));
+        for (int i = 0; i < s->max_blocks; i++) s->block_reps[i] = calloc(p->dim, sizeof(float));
+        s->partial_block = calloc(p->dim, sizeof(float));
+        s->attnres_out = calloc(p->dim, sizeof(float));
+        s->n_blocks = 0;
+    } else {
+        s->block_reps = NULL; s->partial_block = NULL;
+        s->attnres_out = NULL; s->max_blocks = 0; s->n_blocks = 0;
+    }
+
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->logits) {
         fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE);
     }
@@ -227,6 +251,11 @@ void free_run_state(RunState* s, Config* p) {
         }
         free(s->conv_state); free(s->recurrent_state);
     }
+    if (s->block_reps) {
+        for (int i = 0; i < s->max_blocks; i++) free(s->block_reps[i]);
+        free(s->block_reps);
+    }
+    free(s->partial_block); free(s->attnres_out);
 }
 
 void memory_map_weights(TransformerWeights *w, Config* p, void* ptr) {
@@ -254,6 +283,10 @@ void memory_map_weights(TransformerWeights *w, Config* p, void* ptr) {
     w->in_proj_b = calloc(n, sizeof(QuantizedTensor*));
     w->in_proj_a = calloc(n, sizeof(QuantizedTensor*));
     w->out_proj = calloc(n, sizeof(QuantizedTensor*));
+    w->attn_res_proj = calloc(n, sizeof(float*));
+    w->attn_res_norm = calloc(n, sizeof(float*));
+    w->mlp_res_proj = calloc(n, sizeof(float*));
+    w->mlp_res_norm = calloc(n, sizeof(float*));
     w->w1 = calloc(n, sizeof(QuantizedTensor*));
     w->w2 = calloc(n, sizeof(QuantizedTensor*));
     w->w3 = calloc(n, sizeof(QuantizedTensor*));
@@ -298,6 +331,14 @@ void memory_map_weights(TransformerWeights *w, Config* p, void* ptr) {
             w->gated_norm_weight[l] = (float*)ptr; ptr = (float*)ptr + p->linear_value_head_dim;
             w->out_proj[l] = malloc(sizeof(QuantizedTensor));
             map_quantized_tensor(w->out_proj[l], &ptr, value_dim * p->dim);
+        }
+
+        // AttnRes weights (fp32)
+        if (p->attnres_block_size > 0) {
+            w->attn_res_proj[l] = (float*)ptr; ptr = (float*)ptr + p->dim;
+            w->attn_res_norm[l] = (float*)ptr; ptr = (float*)ptr + p->dim;
+            w->mlp_res_proj[l] = (float*)ptr;  ptr = (float*)ptr + p->dim;
+            w->mlp_res_norm[l] = (float*)ptr;  ptr = (float*)ptr + p->dim;
         }
 
         // FFN
@@ -354,6 +395,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     config->linear_key_head_dim = linear_params[2];
     config->linear_value_head_dim = linear_params[3];
     config->linear_conv_kernel_dim = linear_params[4];
+    config->attnres_block_size = linear_params[5];
 
     unsigned char shared_flag;
     if (fread(&shared_flag, sizeof(unsigned char), 1, file) != 1) exit(EXIT_FAILURE);
@@ -418,6 +460,8 @@ void free_transformer(Transformer* t) {
     free(w->wq); free(w->wk); free(w->wv); free(w->wo);
     free(w->in_proj_qkv); free(w->in_proj_z); free(w->in_proj_b);
     free(w->in_proj_a); free(w->out_proj);
+    free(w->attn_res_proj); free(w->attn_res_norm);
+    free(w->mlp_res_proj); free(w->mlp_res_norm);
     free(w->w1); free(w->w2); free(w->w3);
 }
 
@@ -492,6 +536,36 @@ void reset_linear_state(RunState* s, Config* p) {
     }
 }
 
+void block_attn_res(float* out, float** block_reps, int n_blocks,
+                    float* partial_block, float* proj_weight,
+                    float* norm_weight, int dim, float eps) {
+    int total = n_blocks + 1;
+    float logits[64];
+    for (int n = 0; n < total; n++) {
+        float* v = (n < n_blocks) ? block_reps[n] : partial_block;
+        float ss = 0.0f;
+        for (int j = 0; j < dim; j++) ss += v[j] * v[j];
+        ss = 1.0f / sqrtf(ss / dim + eps);
+        float dot = 0.0f;
+        for (int j = 0; j < dim; j++) {
+            float normed = (1.0f + norm_weight[j]) * (ss * v[j]);
+            dot += proj_weight[j] * normed;
+        }
+        logits[n] = dot;
+    }
+    float max_val = logits[0];
+    for (int n = 1; n < total; n++) if (logits[n] > max_val) max_val = logits[n];
+    float sum = 0.0f;
+    for (int n = 0; n < total; n++) { logits[n] = expf(logits[n] - max_val); sum += logits[n]; }
+    for (int n = 0; n < total; n++) logits[n] /= sum;
+    memset(out, 0, dim * sizeof(float));
+    for (int n = 0; n < total; n++) {
+        float* v = (n < n_blocks) ? block_reps[n] : partial_block;
+        float w = logits[n];
+        for (int j = 0; j < dim; j++) out[j] += w * v[j];
+    }
+}
+
 float* forward(Transformer* transformer, int token, int pos) {
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
@@ -516,12 +590,36 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     memcpy(x, w->token_embedding_table + token * dim, dim * sizeof(float));
 
+    int use_attnres = p->attnres_block_size > 0;
+    if (use_attnres) {
+        memcpy(s->block_reps[0], x, dim * sizeof(float));
+        s->n_blocks = 1;
+        memcpy(s->partial_block, x, dim * sizeof(float));
+    }
+
     int full_idx = 0;
     int lin_idx = 0;
 
     for (int l = 0; l < p->n_layers; l++) {
 
-        rmsnorm(s->xb, x, w->rms_att_weight[l], dim, eps);
+        if (use_attnres) {
+            int sublayer_idx = l * 2;
+            int is_boundary = (sublayer_idx > 0 && sublayer_idx % p->attnres_block_size == 0);
+            if (is_boundary) {
+                memcpy(s->block_reps[s->n_blocks], s->partial_block, dim * sizeof(float));
+                s->n_blocks++;
+                block_attn_res(s->xb, s->block_reps, s->n_blocks,
+                               s->block_reps[s->n_blocks - 1],
+                               w->attn_res_proj[l], w->attn_res_norm[l], dim, eps);
+            } else {
+                block_attn_res(s->xb, s->block_reps, s->n_blocks,
+                               s->partial_block,
+                               w->attn_res_proj[l], w->attn_res_norm[l], dim, eps);
+            }
+            rmsnorm(s->xb, s->xb, w->rms_att_weight[l], dim, eps);
+        } else {
+            rmsnorm(s->xb, x, w->rms_att_weight[l], dim, eps);
+        }
 
         if (p->layer_types[l] == 1) {
             // ==================== FULL ATTENTION (quantized matmuls) ====================
@@ -698,11 +796,24 @@ float* forward(Transformer* transformer, int token, int pos) {
             lin_idx++;
         }
 
-        // residual
-        for (int i = 0; i < dim; i++) x[i] += s->xb2[i];
+        if (use_attnres) {
+            int sublayer_idx = l * 2;
+            int is_boundary = (sublayer_idx > 0 && sublayer_idx % p->attnres_block_size == 0);
+            if (is_boundary) {
+                memcpy(s->partial_block, s->xb2, dim * sizeof(float));
+            } else {
+                for (int i = 0; i < dim; i++) s->partial_block[i] += s->xb2[i];
+            }
+            block_attn_res(s->xb, s->block_reps, s->n_blocks,
+                           s->partial_block,
+                           w->mlp_res_proj[l], w->mlp_res_norm[l], dim, eps);
+            rmsnorm(s->xb, s->xb, w->rms_ffn_weight[l], dim, eps);
+        } else {
+            for (int i = 0; i < dim; i++) x[i] += s->xb2[i];
+            rmsnorm(s->xb, x, w->rms_ffn_weight[l], dim, eps);
+        }
 
         // FFN (quantized matmuls)
-        rmsnorm(s->xb, x, w->rms_ffn_weight[l], dim, eps);
         quantize(&s->xq, s->xb, dim);
         matmul(s->hb, &s->xq, w->w1[l], dim, hidden_dim);
         matmul(s->hb2, &s->xq, w->w3[l], dim, hidden_dim);
@@ -714,10 +825,19 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
         quantize(&s->hq, s->hb, hidden_dim);
         matmul(s->xb, &s->hq, w->w2[l], hidden_dim, dim);
-        for (int i = 0; i < dim; i++) x[i] += s->xb[i];
+
+        if (use_attnres) {
+            for (int i = 0; i < dim; i++) s->partial_block[i] += s->xb[i];
+        } else {
+            for (int i = 0; i < dim; i++) x[i] += s->xb[i];
+        }
     }
 
-    rmsnorm(x, x, w->rms_final_weight, dim, eps);
+    if (use_attnres) {
+        rmsnorm(x, s->partial_block, w->rms_final_weight, dim, eps);
+    } else {
+        rmsnorm(x, x, w->rms_final_weight, dim, eps);
+    }
     quantize(&s->xq, x, dim);
     matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
     return s->logits;
