@@ -32,9 +32,10 @@ from tokenizer import Tokenizer
 DATA_CACHE_DIR = "data"
 
 
-def clean_text(text):
-    """Lowercase and normalize Unicode to ASCII."""
-    text = text.lower()
+def clean_text(text, lowercase=False):
+    """Normalize Unicode to ASCII. Optionally lowercase."""
+    if lowercase:
+        text = text.lower()
     for src, dst in [
         ("\u2018", "'"), ("\u2019", "'"),  # smart single quotes
         ("\u201c", '"'), ("\u201d", '"'),  # smart double quotes
@@ -104,7 +105,8 @@ def train_vocab(vocab_size):
             with open(shard, "r") as f:
                 data = json.load(f)
             for example in data:
-                of.write(example["story"] + "\n")
+                # lowercase for custom tokenizer training so vocab is all lowercase
+                of.write(example["story"].lower() + "\n")
     print(f"Size is: {os.path.getsize(tiny_file) / 1024 / 1024:.2f} MB")
 
     print("Training the vocab...")
@@ -142,6 +144,8 @@ def process_shard(args, vocab_size):
     for example in tqdm(data, position=shard_id):
         text = example["story"]
         text = text.strip()
+        if vocab_size > 0:
+            text = text.lower()  # custom tokenizer was trained on lowercased text
         tokens = enc.encode(text, bos=True, eos=False)
         all_tokens.extend(tokens)
     all_tokens = np.array(all_tokens, dtype=np.uint16)

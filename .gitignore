@@ -535,3 +535,4 @@ data/SimpleStories/train_210.json
 data/SimpleStories/train_211.bin
 data/SimpleStories/train_211.json
 __pycache__/simplestories.cpython-310.pyc
+out/model_q8.bin
