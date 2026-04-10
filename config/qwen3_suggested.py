@@ -27,6 +27,7 @@ linear_conv_kernel_dim = 4
 attnres_block_size = 4              # block attention residuals (4 sub-layers per block = 2 layers)
 
 # data
+dataset = "tinystories"
 batch_size = 64
 max_seq_len = 256
 vocab_size = 32000

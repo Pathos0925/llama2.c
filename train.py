@@ -28,7 +28,6 @@ from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from tinystories import Task
 from export import model_export
 
 # -----------------------------------------------------------------------------
@@ -45,6 +44,7 @@ wandb_log = False  # disabled by default
 wandb_project = "llamac"
 wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
+dataset = "tinystories"  # "tinystories" or "simplestories"
 batch_size = 64  # if gradient_accumulation_steps > 1, this is the micro-batch size
 max_seq_len = 256
 vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
@@ -99,8 +99,15 @@ lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla
 min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 # validating checks
+assert dataset in ["tinystories", "simplestories"]
 assert vocab_source in ["llama2", "custom"]
 assert vocab_source == "custom" or vocab_size == 32000, "The vocab from Meta has 32K tokens"
+
+# import the right dataset Task
+if dataset == "simplestories":
+    from simplestories import Task
+else:
+    from tinystories import Task
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
