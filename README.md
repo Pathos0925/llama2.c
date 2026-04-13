@@ -1,4 +1,8 @@
-## llama2.c with Qwen3.5 architecture
+## llama2.c with Qwen3.5 Loop-Cached Reasoning
+
+<p align="center">
+  <img src="assets/llamathink.jpg" width="430" height="300" alt="Llama Think">
+</p>
 
 > **Architecture update:** This fork has been migrated from the original Llama 2 architecture to **Qwen3.5**. Both Python training and C inference (fp32 + int8 quantized) are fully working. See [Architecture changes](#architecture-changes) below.
 
