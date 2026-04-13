@@ -73,6 +73,15 @@ attnres_block_size = 0
 mc_segment_size = 0        # 0 = disabled; >0 = segment size in tokens
 mc_ssc_top_k = 2           # SSC: number of past segments to select
 mc_detach_cached_states = True  # detach cached states from computation graph
+# LoopLM -- weight-tied layer looping with adaptive exit
+loop_max_steps = 1         # 1 = disabled; >1 = number of loop iterations
+loop_kl_beta = 0.1         # entropy regularization coefficient (Stage I)
+loop_exit_threshold = 0.9  # CDF threshold for inference early exit
+loop_training_stage = 1    # 1 = joint training, 2 = gate-only (Stage II)
+# Loop-axis Memory Caching
+loop_mc_enabled = False    # cache linear-attn states across loop iterations
+loop_mc_top_k = 2          # top-k past loop iterations to select via SSC
+loop_mc_detach = True      # detach loop-cached states from grad graph
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
@@ -190,6 +199,12 @@ model_args = dict(
     mc_segment_size=mc_segment_size,
     mc_ssc_top_k=mc_ssc_top_k,
     mc_detach_cached_states=mc_detach_cached_states,
+    loop_max_steps=loop_max_steps,
+    loop_kl_beta=loop_kl_beta,
+    loop_exit_threshold=loop_exit_threshold,
+    loop_mc_enabled=loop_mc_enabled,
+    loop_mc_top_k=loop_mc_top_k,
+    loop_mc_detach=loop_mc_detach,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -209,7 +224,8 @@ elif init_from == "resume":
                "layer_types", "linear_num_key_heads", "linear_num_value_heads",
                "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim",
                "attnres_block_size",
-               "mc_segment_size", "mc_ssc_top_k", "mc_detach_cached_states"]:
+               "mc_segment_size", "mc_ssc_top_k", "mc_detach_cached_states",
+               "loop_max_steps", "loop_mc_enabled", "loop_mc_top_k"]:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     # create the model
@@ -226,6 +242,14 @@ elif init_from == "resume":
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 model.to(device)
+
+# LoopLM: set training stage on model and handle Stage II parameter freezing
+if loop_max_steps > 1:
+    model.training_stage = loop_training_stage
+    if loop_training_stage == 2:
+        # Stage II: freeze everything except exit gate
+        for name, param in model.named_parameters():
+            param.requires_grad = 'exit_gate' in name
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
@@ -299,6 +323,16 @@ while True:
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
+
+    # LoopLM: KL coefficient annealing (linear decay over second half of training)
+    if loop_max_steps > 1 and loop_training_stage == 1:
+        anneal_start = max_iters // 2
+        if iter_num >= anneal_start:
+            frac = (iter_num - anneal_start) / max(1, max_iters - anneal_start)
+            current_kl_beta = loop_kl_beta * (1.0 - 0.5 * frac)  # decay to 50%
+        else:
+            current_kl_beta = loop_kl_beta
+        raw_model.params.loop_kl_beta = current_kl_beta
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -376,16 +410,26 @@ while True:
             f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt*1000:.2f}ms | mfu {running_mfu*100:.2f}%"
         )
         if wandb_log:
-            wandb.log(
-                {
-                    "iter": iter_num,
-                    "tokens": iter_num * tokens_per_iter,
-                    "train/loss": lossf,
-                    "train/lr": lr,
-                    "train/mfu": running_mfu * 100,
-                    "train/iter_time_ms": dt * 1000,
-                }, step=iter_num
-            )
+            log_dict = {
+                "iter": iter_num,
+                "tokens": iter_num * tokens_per_iter,
+                "train/loss": lossf,
+                "train/lr": lr,
+                "train/mfu": running_mfu * 100,
+                "train/iter_time_ms": dt * 1000,
+            }
+            # LoopLM diagnostics
+            if loop_max_steps > 1 and raw_model.loop_step_losses is not None:
+                for si, sl in enumerate(raw_model.loop_step_losses):
+                    log_dict[f"loop/step_{si}_loss"] = sl
+                if raw_model.loop_exit_distribution is not None:
+                    for si, ep in enumerate(raw_model.loop_exit_distribution):
+                        log_dict[f"loop/exit_prob_step_{si}"] = ep
+                    # Weighted average exit step
+                    mean_exit = sum(si * ep for si, ep in enumerate(raw_model.loop_exit_distribution))
+                    log_dict["loop/mean_exit_step"] = mean_exit
+                log_dict["loop/kl_beta"] = raw_model.params.loop_kl_beta
+            wandb.log(log_dict, step=iter_num)
     iter_num += 1
     local_iter_num += 1
 

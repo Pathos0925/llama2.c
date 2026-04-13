@@ -40,6 +40,14 @@ class ModelArgs:
     mc_segment_size: int = 0
     mc_ssc_top_k: int = 2          # SSC: how many past segments to select per token
     mc_detach_cached_states: bool = True  # detach cached states from computation graph
+    # LoopLM -- weight-tied layer looping with adaptive exit
+    loop_max_steps: int = 1        # 1 = no looping (standard model); >1 = LoopLM enabled
+    loop_kl_beta: float = 0.1      # entropy regularization coefficient (Stage I)
+    loop_exit_threshold: float = 0.9  # CDF threshold q for early exit at inference
+    # Loop-axis Memory Caching (active when loop_max_steps>1 and mc_segment_size>0)
+    loop_mc_enabled: bool = False   # cache linear-attn states across loop iterations
+    loop_mc_top_k: int = 2          # top-k past loop iterations to select via SSC
+    loop_mc_detach: bool = True     # detach loop-cached states from grad graph
 
 
 class RMSNorm(torch.nn.Module):
@@ -88,6 +96,17 @@ class BlockAttnRes(nn.Module):
         weights = torch.softmax(logits, dim=0)
         h = torch.einsum('n b t, n b t d -> b t d', weights, V)
         return h
+
+
+class ExitGate(nn.Module):
+    """LoopLM exit gate: predicts per-token probability of exiting at each loop step."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.proj = nn.Linear(dim, 1, bias=True)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """h: [B, T, D] -> lambda_t: [B, T] in (0, 1)"""
+        return torch.sigmoid(self.proj(h).squeeze(-1))
 
 
 def precompute_freqs_cis(head_dim: int, end: int, theta: float = 10_000_000.0, partial_rotary_factor: float = 0.25):
@@ -362,6 +381,10 @@ class LinearAttention(nn.Module):
             # to [B, T, num_v_heads, head_k_dim] for per-head routing scores.
             self.mc_u_proj = nn.Linear(self.hidden_size, self.num_v_heads * self.head_k_dim, bias=False)
 
+        # State extraction for loop-axis MC (set during forward, read by Transformer)
+        self.last_final_state = None   # [B, H, k, v] after last segment
+        self.last_full_context = None  # [B, H, k] sum of keys over full sequence
+
     def _mc_ssc_aggregate(self, online_out, query_seg, u_seg, seg_context,
                           cached_states, cached_contexts):
         """Sparse Selective Caching aggregation for one MC segment.
@@ -431,7 +454,66 @@ class LinearAttention(nn.Module):
         # Back to [B, T, H, v]
         return result.transpose(1, 2)
 
-    def forward(self, x: torch.Tensor):
+    def _loop_mc_aggregate(self, core_out, query, x, full_context,
+                           loop_cached_states, loop_cached_contexts):
+        """SSC aggregation across cached loop-iteration memories.
+
+        Same math as _mc_ssc_aggregate but operates on full-sequence outputs
+        from prior loop iterations rather than prior sequence segments.
+
+        Args:
+            core_out:    [B, T, H, v] -- current loop's output
+            query:       [B, T, H, k] -- L2-normed queries (full sequence)
+            x:           [B, T, D] -- input hidden states (for router projection)
+            full_context:[B, H, k] -- sum of keys over full sequence
+            loop_cached_states:   list of [B, H, k, v] from prior loops
+            loop_cached_contexts: list of [B, H, k] from prior loops
+        Returns:
+            aggregated output: [B, T, H, v]
+        """
+        num_cached = len(loop_cached_states)
+        if num_cached == 0:
+            return core_out
+
+        bsz, seq_len, num_heads, head_k = query.shape
+        scale = 1.0 / (head_k ** 0.5)
+
+        # Router projection (separate from sequence-axis mc_u_proj)
+        u = self.loop_mc_u_proj(x).reshape(bsz, seq_len, num_heads, head_k)
+
+        # Query cached states
+        all_states = torch.stack(loop_cached_states, dim=1).transpose(1, 2)  # [B,H,C,k,v]
+        q_scaled = query.transpose(1, 2) * scale  # [B,H,T,k]
+        cached_outs = torch.einsum("bhtk,bhckv->bhctv", q_scaled, all_states)
+
+        # Router scores
+        u_t = u.transpose(1, 2)  # [B,H,T,k]
+        ctx_stack = torch.stack(loop_cached_contexts, dim=1).transpose(1, 2)  # [B,H,C,k]
+        cached_scores = torch.einsum("bhtk,bhck->bhtc", u_t, ctx_stack)
+
+        # Top-k selection
+        k = min(self.loop_mc_top_k, num_cached)
+        topk_indices = torch.topk(cached_scores, k=k, dim=-1).indices
+        mask = torch.zeros_like(cached_scores, dtype=torch.bool)
+        mask.scatter_(-1, topk_indices, True)
+        masked_scores = cached_scores.masked_fill(~mask, float("-inf"))
+
+        # Online score
+        online_scores = torch.einsum("bhtk,bhk->bht", u_t, full_context)
+
+        # Softmax over (cached, online)
+        all_scores = torch.cat([masked_scores, online_scores.unsqueeze(-1)], dim=-1)
+        all_weights = torch.softmax(all_scores, dim=-1)
+        cached_weights = all_weights[..., :-1]
+        online_weight = all_weights[..., -1:]
+
+        # Weighted combination
+        online_t = core_out.transpose(1, 2)
+        result = online_weight * online_t
+        result = result + torch.einsum("bhtc,bhctv->bhtv", cached_weights, cached_outs)
+        return result.transpose(1, 2)
+
+    def forward(self, x: torch.Tensor, loop_cached_states=None, loop_cached_contexts=None):
         bsz, seq_len, _ = x.shape
 
         # QKV projection + causal conv (full sequence for cross-segment continuity)
@@ -464,12 +546,18 @@ class LinearAttention(nn.Module):
 
         mc_enabled = self.mc_segment_size > 0 and seq_len > self.mc_segment_size
 
+        # Track whether we need final state for loop-axis MC
+        need_final_state = (loop_cached_states is not None) or hasattr(self, 'loop_mc_u_proj')
+
         if not mc_enabled:
             # Standard path: no memory caching
-            core_out, _ = chunk_gated_delta_rule(
+            core_out, final_state = chunk_gated_delta_rule(
                 query, key, value, g=g, beta=beta,
-                initial_state=None, output_final_state=False,
+                initial_state=None, output_final_state=need_final_state,
             )
+            # Store for loop-axis MC extraction
+            self.last_final_state = final_state
+            self.last_full_context = key.sum(dim=1)  # [B, H, k]
         else:
             # Memory Caching path: segment, cache states, SSC aggregate
             mc_seg = self.mc_segment_size
@@ -527,6 +615,18 @@ class LinearAttention(nn.Module):
 
             core_out = torch.cat(segment_outputs, dim=1)
 
+            # Store for loop-axis MC extraction (last segment's final state)
+            self.last_final_state = cached_states[-1] if cached_states else None
+            # Full-sequence context: sum of all segment contexts
+            self.last_full_context = torch.stack(cached_contexts).sum(dim=0) if cached_contexts else key.sum(dim=1)
+
+        # Loop-axis MC aggregation: blend with cached states from prior loop iterations
+        if loop_cached_states is not None and len(loop_cached_states) > 0:
+            core_out = self._loop_mc_aggregate(
+                core_out, query, x, self.last_full_context,
+                loop_cached_states, loop_cached_contexts,
+            )
+
         # Gated RMSNorm: norm(attn_out) * SiLU(z)
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -578,7 +678,13 @@ class TransformerBlock(nn.Module):
             self.attn_res = BlockAttnRes(args.dim, eps=args.norm_eps)
             self.mlp_res = BlockAttnRes(args.dim, eps=args.norm_eps)
 
-    def forward(self, blocks, partial_block, freqs_cos, freqs_sin):
+    def forward(self, blocks, partial_block, freqs_cos, freqs_sin,
+                loop_cached_states=None, loop_cached_contexts=None):
+        # loop_cached_states/contexts: passed to LinearAttention for loop-axis MC
+        # (ignored for full attention layers)
+        lcs = loop_cached_states if self.layer_type == "linear" else None
+        lcc = loop_cached_contexts if self.layer_type == "linear" else None
+
         if self.attnres_block_size > 0:
             # Block boundary: snapshot partial_block and start fresh
             sublayer_idx = self.layer_id * 2
@@ -595,7 +701,7 @@ class TransformerBlock(nn.Module):
             if self.layer_type == "full":
                 attn_out = self.attention(self.attention_norm(h), freqs_cos, freqs_sin)
             else:
-                attn_out = self.attention(self.attention_norm(h))
+                attn_out = self.attention(self.attention_norm(h), lcs, lcc)
 
             # Start new partial_block at boundary, or accumulate
             if sublayer_idx > 0 and sublayer_idx % self.attnres_block_size == 0:
@@ -616,7 +722,7 @@ class TransformerBlock(nn.Module):
             if self.layer_type == "full":
                 h = partial_block + self.attention(self.attention_norm(partial_block), freqs_cos, freqs_sin)
             else:
-                h = partial_block + self.attention(self.attention_norm(partial_block))
+                h = partial_block + self.attention(self.attention_norm(partial_block), lcs, lcc)
             out = h + self.feed_forward(self.ffn_norm(h))
             return blocks, out
 
@@ -665,8 +771,27 @@ class Transformer(nn.Module):
             if pn.endswith('w3.weight') or pn.endswith('wo.weight') or pn.endswith('out_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
 
+        # LoopLM: exit gate and loop-axis MC router projections
+        if params.loop_max_steps > 1:
+            self.exit_gate = ExitGate(params.dim)
+            # Loop-axis MC: add separate router projection to each linear attention layer
+            if params.loop_mc_enabled and params.mc_segment_size > 0:
+                for layer in self.layers:
+                    if layer.layer_type == "linear":
+                        la = layer.attention
+                        la.loop_mc_top_k = params.loop_mc_top_k
+                        la.loop_mc_detach = params.loop_mc_detach
+                        la.loop_mc_u_proj = nn.Linear(
+                            params.dim, la.num_v_heads * la.head_k_dim, bias=False
+                        )
+
         # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_loss = None
+        # Training stage: set by train.py (1=joint, 2=gate-only)
+        self.training_stage = 1
+        # Per-step diagnostics (set during forward when looping)
+        self.loop_step_losses = None
+        self.loop_exit_distribution = None
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -676,6 +801,40 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _run_layers(self, h, freqs_cos, freqs_sin, loop_cache=None):
+        """Run all transformer layers once. Returns normed output.
+
+        Args:
+            h: [B, T, D] input hidden states
+            freqs_cos, freqs_sin: RoPE frequencies
+            loop_cache: dict of {layer_idx: (cached_states, cached_contexts)} for loop-MC,
+                        or None to disable loop-axis MC
+        Returns:
+            h_out: [B, T, D] normed output
+        """
+        blocks = [h]
+        partial_block = h
+        for layer_idx, layer in enumerate(self.layers):
+            lcs, lcc = None, None
+            if loop_cache is not None and layer_idx in loop_cache:
+                lcs, lcc = loop_cache[layer_idx]
+            blocks, partial_block = layer(
+                blocks, partial_block, freqs_cos, freqs_sin,
+                loop_cached_states=lcs, loop_cached_contexts=lcc,
+            )
+        return self.norm(partial_block)
+
+    def _collect_loop_states(self):
+        """Extract final states and contexts from all linear attention layers.
+        Called after _run_layers to capture what this loop iteration learned."""
+        states = {}
+        for layer_idx, layer in enumerate(self.layers):
+            if layer.layer_type == "linear":
+                la = layer.attention
+                if la.last_final_state is not None:
+                    states[layer_idx] = (la.last_final_state, la.last_full_context)
+        return states
+
     def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
@@ -683,22 +842,131 @@ class Transformer(nn.Module):
         freqs_cos = self.freqs_cos[:seqlen]
         freqs_sin = self.freqs_sin[:seqlen]
 
-        # Token embedding is the first "block" and the initial partial sum
-        blocks = [h]
-        partial_block = h
+        if self.params.loop_max_steps <= 1:
+            # ---- Standard non-looped path (unchanged) ----
+            h = self._run_layers(h, freqs_cos, freqs_sin)
 
-        for layer in self.layers:
-            blocks, partial_block = layer(blocks, partial_block, freqs_cos, freqs_sin)
-        h = self.norm(partial_block)
+            if targets is not None:
+                logits = self.output(h)
+                self.last_loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            else:
+                logits = self.output(h[:, [-1], :])
+                self.last_loss = None
+            self.loop_step_losses = None
+            self.loop_exit_distribution = None
+            return logits
 
+        # ---- LoopLM path ----
+        T_max = self.params.loop_max_steps
+        loop_mc_on = (self.params.loop_mc_enabled and self.params.mc_segment_size > 0
+                      and hasattr(self.layers[0].attention, 'loop_mc_u_proj')
+                      if self.layers[0].layer_type == "linear" else False)
+        detach_loop = self.params.loop_mc_detach
+
+        loop_losses = []       # per-step [B, T] losses (training only)
+        exit_lambdas = []      # per-step [B, T] exit probabilities
+        # loop_cache: layer_idx -> list of (state, context) per prior loop
+        loop_cache_lists = {}  # {layer_idx: ([states], [contexts])}
+
+        survival = None  # for inference early exit
+
+        for t in range(T_max):
+            # Build loop-axis MC cache dict for this iteration
+            loop_cache = None
+            if loop_mc_on and loop_cache_lists:
+                loop_cache = {
+                    li: (states, contexts)
+                    for li, (states, contexts) in loop_cache_lists.items()
+                }
+
+            # Run all layers (each loop sees the same weights — weight tying)
+            h_out = self._run_layers(h, freqs_cos, freqs_sin, loop_cache=loop_cache)
+
+            # Exit gate
+            lambda_t = self.exit_gate(h_out)  # [B, T]
+            exit_lambdas.append(lambda_t)
+
+            # Cache loop states for future iterations
+            if loop_mc_on:
+                iter_states = self._collect_loop_states()
+                for li, (state, ctx) in iter_states.items():
+                    if li not in loop_cache_lists:
+                        loop_cache_lists[li] = ([], [])
+                    s = state.detach().clone() if detach_loop else state.clone()
+                    c = ctx.detach().clone() if detach_loop else ctx.clone()
+                    loop_cache_lists[li][0].append(s)
+                    loop_cache_lists[li][1].append(c)
+
+            # Compute per-step loss (training)
+            if targets is not None:
+                logits_t = self.output(h_out)
+                loss_t = F.cross_entropy(
+                    logits_t.view(-1, logits_t.size(-1)),
+                    targets.view(-1), ignore_index=-1, reduction='none'
+                ).view(_bsz, seqlen)
+                loop_losses.append(loss_t)
+
+            # Inference early exit
+            if targets is None:
+                if survival is None:
+                    survival = torch.ones_like(lambda_t)
+                p_t = lambda_t * survival
+                survival = survival * (1 - lambda_t)
+                cdf = 1.0 - survival
+                # Exit when all tokens across batch exceed threshold
+                if cdf.min().item() >= self.params.loop_exit_threshold:
+                    break
+
+            # Update hidden state for next loop iteration
+            h = h_out
+
+        # ---- Compute final loss ----
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # Compute exit distribution p(t|x)
+            surv = torch.ones_like(exit_lambdas[0])
+            exit_probs = []
+            for t_idx in range(len(exit_lambdas)):
+                if t_idx < len(exit_lambdas) - 1:
+                    exit_probs.append(exit_lambdas[t_idx] * surv)
+                    surv = surv * (1 - exit_lambdas[t_idx])
+                else:
+                    # Forced exit at T_max: all remaining probability mass
+                    exit_probs.append(surv)
+            exit_probs = torch.stack(exit_probs, dim=0)  # [T_steps, B, T]
+            losses_stack = torch.stack(loop_losses, dim=0)  # [T_steps, B, T]
+
+            if self.training_stage == 2:
+                # Stage II: adaptive gate training (LM frozen, train exit gate only)
+                adaptive_losses = []
+                for t_idx in range(1, len(loop_losses)):
+                    with torch.no_grad():
+                        improvement = torch.clamp(loop_losses[t_idx - 1] - loop_losses[t_idx], min=0)
+                        w_t = torch.sigmoid(50.0 * (improvement - 0.005))
+                    lam = exit_lambdas[t_idx]
+                    # BCE: w*log(1-lambda) + (1-w)*log(lambda)
+                    bce = w_t * torch.log(1 - lam + 1e-8) + (1 - w_t) * torch.log(lam + 1e-8)
+                    adaptive_losses.append(-bce.mean())
+                self.last_loss = torch.stack(adaptive_losses).mean() if adaptive_losses else torch.tensor(0.0)
+            else:
+                # Stage I: entropy-regularized expected loss
+                expected_loss = (exit_probs.detach() * losses_stack).sum(dim=0).mean()
+                # Entropy of exit distribution
+                log_probs = torch.log(exit_probs + 1e-8)
+                entropy = -(exit_probs * log_probs).sum(dim=0).mean()
+                self.last_loss = expected_loss - self.params.loop_kl_beta * entropy
+
+            # Store diagnostics
+            self.loop_step_losses = [l.mean().item() for l in loop_losses]
+            self.loop_exit_distribution = exit_probs.mean(dim=(1, 2)).detach().cpu().tolist()
+
+            logits = self.output(h_out)
         else:
-            # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # Inference: return logits from final loop iteration
+            logits = self.output(h_out[:, [-1], :])
             self.last_loss = None
+            self.loop_step_losses = None
+            self.loop_exit_distribution = None
 
         return logits
 
