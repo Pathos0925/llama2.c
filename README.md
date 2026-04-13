@@ -202,6 +202,31 @@ The v4 quantized format is ~3.4x smaller and ~25% faster than v3 fp32, with mini
 
 Older v0/v1/v2 formats from the original llama2.c are incompatible with the new Qwen3.5 model.
 
+### Memory Caching (MC)
+
+The linear attention layers optionally support **Memory Caching** from ["Memory Caching: RNNs with Growing Memory"](https://arxiv.org/abs/2602.24281). MC segments the sequence and caches the Gated Delta Net state at segment boundaries, allowing each token to query compressed memories from earlier segments. This gives linear attention layers a growing memory that interpolates between the fixed state of RNNs and the full KV cache of Transformers.
+
+We use the **Sparse Selective Caching (SSC)** aggregation strategy: a learned router selects the top-k most relevant cached segment memories per token, then softmax-weights their outputs with the current segment's online output.
+
+MC is disabled by default (`mc_segment_size=0`) with zero overhead. To enable it:
+
+```python
+# In a config file or via command line
+mc_segment_size = 128      # segment size in tokens (0=disabled)
+mc_ssc_top_k = 2           # number of past segments to select per token
+mc_detach_cached_states = True  # detach cached states from grad graph (saves memory)
+```
+
+An example config is provided:
+
+```bash
+python train.py config/qwen3_simplestories_4k_mc.py
+```
+
+**Note:** MC uses a dynamic segment loop that is not compatible with `torch.compile`. Set `compile=False` when using MC. The MC config file does this automatically.
+
+See `MEMORY_CACHING_PLAN.md` for detailed design documentation.
+
 ### config files
 
 Training configs live in the `config/` directory:
@@ -209,6 +234,7 @@ Training configs live in the `config/` directory:
 ```bash
 python train.py config/qwen3_original.py     # original defaults
 python train.py config/qwen3_suggested.py     # tuned hyperparameters (recommended)
+python train.py config/qwen3_simplestories_4k_mc.py  # with Memory Caching
 ```
 
 You can also override individual params: `python train.py config/qwen3_suggested.py --max_iters=50000`
@@ -227,6 +253,14 @@ Then train our model:
 ```bash
 python train.py
 ```
+
+**wandb logging**. Training supports [Weights & Biases](https://wandb.ai/) for experiment tracking. Enable it with:
+
+```bash
+python train.py --wandb_log=True --wandb_project=my_project --wandb_run_name=my_run
+```
+
+This logs training loss, learning rate, MFU, and iteration time per step.
 
 **brief training guide**. See the train.py script for more exotic launches and hyperparameter overrides. Here is a brief guide to how to set the parameters. Look at the table at the very end of the [Chinchilla paper](https://arxiv.org/abs/2203.15556) to get a sense of how the Transformer parameters (dim, n_layers, n_heads) grow or shrink together. Extrapolate/interpolate this pattern to get bigger or smaller transformers. Set the max context length however you wish, depending on the problem: this should be the max number of tokens that matter to predict the next token. E.g. Llama 2 uses 2048. Next, you want the _total_ batch size per update (printed by the script as "tokens per iteration will be:") to be somewhere around 100K tokens for medium-sized applications. For tiny applications it could be lower, for large training (e.g. GPTs/LLamas) it is usually ~0.5M, or even more. You get there by first maxing out the batch_size to whatever your system allows (e.g. mine was 16 in a recent run because after that my GPU runs out of memory), and then you want to increase gradient_accumulation_steps to be as high as necessary to reach the total batch size of ~100K. Finally, you want to tune your learning_rate (LR). You want this to be as high as your training allows. Very small networks can get away with a large LR (e.g. 1e-3 or even higher). Large networks need lower LRs. 3e-4 is a safe choice in most medium-sized applications, but can be too low for small networks, so try to increase it! Finally, max_iters is the length of training. Play with different settings. I mostly only ever tune these parameters and leave most of the others unchanged. Here is an example of how I trained the 110M model, which I don't think is anywhere near optimal, but looked sensible to me: dim 768, n_layers 12, n_heads 12 (so size of each head is 768 / 12 = 64 channels), seq len of 1024, batch size 16 (this is the most that fit my A100 40GB GPU), gradient_accumulation_steps = 8 was needed to get total tokens batch size to be 16 batch size * 1024 tokens in sequence * 8 grad_accum = 131,072 tokens per update. Good. Learning rate 4e-4 (probably a little too low). max_iters 200K (probably a bit too high). Dropout 0.1, as that usually helps a bit at medium size. That was it. I ran using Distributed Data Parallel (DDP) on 4 GPUs on my cloud machine, training took ~day or so.
 
