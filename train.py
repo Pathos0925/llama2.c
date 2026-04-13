@@ -69,6 +69,10 @@ linear_value_head_dim = 72
 linear_conv_kernel_dim = 4
 # attention residuals: 0 = disabled, >0 = block_size (sub-layers per block)
 attnres_block_size = 0
+# Memory Caching (MC) for linear attention layers
+mc_segment_size = 0        # 0 = disabled; >0 = segment size in tokens
+mc_ssc_top_k = 2           # SSC: number of past segments to select
+mc_detach_cached_states = True  # detach cached states from computation graph
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
@@ -183,6 +187,9 @@ model_args = dict(
     linear_value_head_dim=linear_value_head_dim,
     linear_conv_kernel_dim=linear_conv_kernel_dim,
     attnres_block_size=attnres_block_size,
+    mc_segment_size=mc_segment_size,
+    mc_ssc_top_k=mc_ssc_top_k,
+    mc_detach_cached_states=mc_detach_cached_states,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -201,8 +208,10 @@ elif init_from == "resume":
                "multiple_of", "max_seq_len", "rope_base", "partial_rotary_factor",
                "layer_types", "linear_num_key_heads", "linear_num_value_heads",
                "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim",
-               "attnres_block_size"]:
-        model_args[k] = checkpoint_model_args[k]
+               "attnres_block_size",
+               "mc_segment_size", "mc_ssc_top_k", "mc_detach_cached_states"]:
+        if k in checkpoint_model_args:
+            model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = ModelArgs(**model_args)
     model = Transformer(gptconf)

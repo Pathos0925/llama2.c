@@ -35,6 +35,11 @@ class ModelArgs:
     # Block Attention Residuals: 0 = disabled (standard residuals)
     # block_size counts sub-layers (attn+mlp = 2 per transformer layer)
     attnres_block_size: int = 0
+    # Memory Caching (MC) -- only affects LinearAttention layers
+    # 0 = disabled; >0 = segment size in tokens for memory caching
+    mc_segment_size: int = 0
+    mc_ssc_top_k: int = 2          # SSC: how many past segments to select per token
+    mc_detach_cached_states: bool = True  # detach cached states from computation graph
 
 
 class RMSNorm(torch.nn.Module):
@@ -307,7 +312,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64,
 
 
 class LinearAttention(nn.Module):
-    """Qwen3.5 Gated Delta Net linear attention layer."""
+    """Qwen3.5 Gated Delta Net linear attention layer, with optional Memory Caching (MC)."""
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.hidden_size = args.dim
@@ -347,10 +352,89 @@ class LinearAttention(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
+        # Memory Caching (MC) -- SSC aggregation over cached segment states
+        self.mc_segment_size = args.mc_segment_size
+        if self.mc_segment_size > 0:
+            self.mc_ssc_top_k = args.mc_ssc_top_k
+            self.mc_detach = args.mc_detach_cached_states
+            # After head expansion, keys have num_v_heads heads.  Router u_t must
+            # match: project hidden_size -> num_v_heads * head_k_dim, then reshape
+            # to [B, T, num_v_heads, head_k_dim] for per-head routing scores.
+            self.mc_u_proj = nn.Linear(self.hidden_size, self.num_v_heads * self.head_k_dim, bias=False)
+
+    def _mc_ssc_aggregate(self, online_out, query_seg, u_seg, seg_context,
+                          cached_states, cached_contexts):
+        """Sparse Selective Caching aggregation for one MC segment.
+
+        Args:
+            online_out: [B, T_seg, num_v_heads, head_v_dim] -- output from chunk_gated_delta_rule
+            query_seg:  [B, T_seg, num_v_heads, head_k_dim] -- L2-normed queries for this segment
+            u_seg:      [B, T_seg, num_v_heads, head_k_dim] -- router vectors for this segment
+            seg_context:[B, num_v_heads, head_k_dim] -- sum of keys in this segment
+            cached_states:   list of [B, num_v_heads, head_k_dim, head_v_dim] tensors
+            cached_contexts: list of [B, num_v_heads, head_k_dim] tensors
+        Returns:
+            aggregated output: [B, T_seg, num_v_heads, head_v_dim]
+        """
+        num_cached = len(cached_states)
+        if num_cached == 0:
+            return online_out
+
+        bsz, seg_len, num_heads, head_k = query_seg.shape
+        scale = 1.0 / (head_k ** 0.5)
+
+        # Compute cached outputs: query each cached state with all tokens in segment
+        # Stack cached states: [B, num_cached, H, k, v]
+        all_states = torch.stack(cached_states, dim=1)
+        # query_seg scaled: [B, T, H, k] -> [B, H, T, k]
+        q_scaled = query_seg.transpose(1, 2) * scale
+        # all_states: [B, num_cached, H, k, v] -> [B, H, num_cached, k, v]
+        all_states = all_states.transpose(1, 2)
+        # Batched einsum: [B, H, T, k] x [B, H, num_cached, k, v] -> [B, H, num_cached, T, v]
+        cached_outs = torch.einsum("bhtk,bhckv->bhctv", q_scaled, all_states)
+
+        # Router scores for cached segments
+        # u_seg: [B, T, H, k] -> [B, H, T, k]
+        u_seg_t = u_seg.transpose(1, 2)
+        # cached_contexts stacked: [B, num_cached, H, k] -> [B, H, num_cached, k]
+        ctx_stack = torch.stack(cached_contexts, dim=1).transpose(1, 2)
+        # scores: [B, H, T, num_cached]
+        cached_scores = torch.einsum("bhtk,bhck->bhtc", u_seg_t, ctx_stack)
+
+        # Top-k selection
+        k = min(self.mc_ssc_top_k, num_cached)
+        topk_indices = torch.topk(cached_scores, k=k, dim=-1).indices
+        mask = torch.zeros_like(cached_scores, dtype=torch.bool)
+        mask.scatter_(-1, topk_indices, True)
+        masked_scores = cached_scores.masked_fill(~mask, float("-inf"))
+
+        # Online score: u_seg dot current segment context
+        # seg_context: [B, H, k] -- broadcast across T
+        online_scores = torch.einsum("bhtk,bhk->bht", u_seg_t, seg_context)
+
+        # Softmax over (masked cached scores, online score)
+        # all_scores: [B, H, T, num_cached + 1]
+        all_scores = torch.cat([masked_scores, online_scores.unsqueeze(-1)], dim=-1)
+        all_weights = torch.softmax(all_scores, dim=-1)
+
+        cached_weights = all_weights[..., :-1]   # [B, H, T, num_cached]
+        online_weight = all_weights[..., -1:]     # [B, H, T, 1]
+
+        # Weighted combination
+        # online_out: [B, T, H, v] -> [B, H, T, v]
+        online_t = online_out.transpose(1, 2)
+        # weighted online: [B, H, T, v]
+        result = online_weight * online_t
+        # weighted cached: einsum [B, H, T, num_cached] x [B, H, num_cached, T, v] -> [B, H, T, v]
+        result = result + torch.einsum("bhtc,bhctv->bhtv", cached_weights, cached_outs)
+
+        # Back to [B, T, H, v]
+        return result.transpose(1, 2)
+
     def forward(self, x: torch.Tensor):
         bsz, seq_len, _ = x.shape
 
-        # QKV projection + causal conv
+        # QKV projection + causal conv (full sequence for cross-segment continuity)
         mixed_qkv = self.in_proj_qkv(x).transpose(1, 2)  # (bsz, conv_dim, seq_len)
         mixed_qkv = torch_causal_conv1d(mixed_qkv, self.conv1d.weight, self.conv1d.bias)
         mixed_qkv = mixed_qkv.transpose(1, 2)  # (bsz, seq_len, conv_dim)
@@ -378,11 +462,70 @@ class LinearAttention(nn.Module):
         query = l2norm(query, dim=-1)
         key = l2norm(key, dim=-1)
 
-        # Gated delta rule recurrence
-        core_out, _ = chunk_gated_delta_rule(
-            query, key, value, g=g, beta=beta,
-            initial_state=None, output_final_state=False,
-        )
+        mc_enabled = self.mc_segment_size > 0 and seq_len > self.mc_segment_size
+
+        if not mc_enabled:
+            # Standard path: no memory caching
+            core_out, _ = chunk_gated_delta_rule(
+                query, key, value, g=g, beta=beta,
+                initial_state=None, output_final_state=False,
+            )
+        else:
+            # Memory Caching path: segment, cache states, SSC aggregate
+            mc_seg = self.mc_segment_size
+            # Router projection on full sequence, reshaped to per-head
+            u = self.mc_u_proj(x).reshape(bsz, seq_len, self.num_v_heads, self.head_k_dim)
+
+            # Build segment spans (last segment may be shorter)
+            spans = []
+            pos = 0
+            while pos < seq_len:
+                end = min(pos + mc_seg, seq_len)
+                spans.append((pos, end))
+                pos = end
+
+            cached_states = []    # list of [B, num_v_heads, head_k_dim, head_v_dim]
+            cached_contexts = []  # list of [B, num_v_heads, head_k_dim]
+            prev_state = None
+            segment_outputs = []
+
+            for start, end in spans:
+                q_seg = query[:, start:end]
+                k_seg = key[:, start:end]
+                v_seg = value[:, start:end]
+                g_seg = g[:, start:end]
+                beta_seg = beta[:, start:end]
+
+                # Run gated delta rule on this segment
+                online_out, final_state = chunk_gated_delta_rule(
+                    q_seg, k_seg, v_seg, g=g_seg, beta=beta_seg,
+                    initial_state=prev_state, output_final_state=True,
+                )
+                # online_out: [B, seg_len, num_v_heads, head_v_dim]
+                # final_state: [B, num_v_heads, head_k_dim, head_v_dim]
+
+                # Segment context: sum of L2-normed keys per head
+                # k_seg: [B, seg_len, H, k] -> [B, H, k] via sum over time dim
+                seg_ctx = k_seg.sum(dim=1)  # [B, num_v_heads, head_k_dim]
+
+                # SSC aggregation
+                u_seg = u[:, start:end]
+                online_out = self._mc_ssc_aggregate(
+                    online_out, q_seg, u_seg, seg_ctx,
+                    cached_states, cached_contexts,
+                )
+
+                segment_outputs.append(online_out)
+
+                # Cache this segment's state and context for future segments
+                state_to_cache = final_state.detach().clone() if self.mc_detach else final_state.clone()
+                cached_states.append(state_to_cache)
+                cached_contexts.append(seg_ctx.detach().clone() if self.mc_detach else seg_ctx.clone())
+
+                # Checkpoint: next segment starts from this segment's final state
+                prev_state = final_state
+
+            core_out = torch.cat(segment_outputs, dim=1)
 
         # Gated RMSNorm: norm(attn_out) * SiLU(z)
         core_out = core_out.reshape(-1, self.head_v_dim)
