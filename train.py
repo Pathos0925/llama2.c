@@ -375,12 +375,26 @@ while True:
         print(
             f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt*1000:.2f}ms | mfu {running_mfu*100:.2f}%"
         )
+        if wandb_log:
+            wandb.log(
+                {
+                    "iter": iter_num,
+                    "tokens": iter_num * tokens_per_iter,
+                    "train/loss": lossf,
+                    "train/lr": lr,
+                    "train/mfu": running_mfu * 100,
+                    "train/iter_time_ms": dt * 1000,
+                }, step=iter_num
+            )
     iter_num += 1
     local_iter_num += 1
 
     # termination conditions
     if iter_num > max_iters:
         break
+
+if wandb_log and master_process:
+    wandb.finish()
 
 if ddp:
     destroy_process_group()
