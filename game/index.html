@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ship RPG</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #0f380f;
+      color: #9bbc0f;
+      font-family: ui-monospace, monospace;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    #game canvas { image-rendering: pixelated; display: block; }
+    #hint { margin-top: 8px; font-size: 12px; opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <div id="game"></div>
+  <div id="hint">arrows / WASD to move &middot; seed=42</div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
