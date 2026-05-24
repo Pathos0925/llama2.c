@@ -101,6 +101,12 @@ device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps
 dtype = "bfloat16"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 num_workers = 0  # data loading workers (0 = main process only)
+# checkpointing
+save_interval = 0  # 0 = only save at eval; >0 = save every N steps
+r2_upload = False  # upload checkpoints to R2
+r2_endpoint = ""
+r2_bucket = ""
+r2_prefix = ""  # path prefix in bucket
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -110,6 +116,57 @@ config_keys = [
 exec(open("configurator.py").read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
+
+_r2_client = None
+def _get_r2_client():
+    global _r2_client
+    if _r2_client is not None:
+        return _r2_client
+    import boto3
+    env_vars = {}
+    for env_path in [".env", "/workspace/LoopCached-Reasoning/.env"]:
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        env_vars[k.strip()] = v.strip()
+            break
+    _r2_client = boto3.client('s3',
+        endpoint_url=r2_endpoint,
+        aws_access_key_id=env_vars.get("access_key_id", ""),
+        aws_secret_access_key=env_vars.get("secret_access_key", ""),
+        region_name='auto'
+    )
+    return _r2_client
+
+def upload_to_r2(local_path, r2_key):
+    if not r2_upload:
+        return
+    try:
+        s3 = _get_r2_client()
+        full_key = f"{r2_prefix}{r2_key}" if r2_prefix else r2_key
+        s3.upload_file(local_path, r2_bucket, full_key)
+        print(f"uploaded {r2_key} to r2://{r2_bucket}/{full_key}")
+    except Exception as e:
+        print(f"r2 upload failed for {r2_key}: {e}")
+
+def save_checkpoint(iter_num, best_val_loss, model_args, raw_model, optimizer, config, out_dir, upload=True):
+    checkpoint = {
+        "model": raw_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "model_args": model_args,
+        "iter_num": iter_num,
+        "best_val_loss": best_val_loss,
+        "config": config,
+    }
+    ckpt_path = os.path.join(out_dir, "ckpt.pt")
+    print(f"saving checkpoint to {out_dir} at step {iter_num}")
+    torch.save(checkpoint, ckpt_path)
+    if upload:
+        upload_to_r2(ckpt_path, f"{out_dir}/ckpt_step{iter_num}.pt")
+        upload_to_r2(ckpt_path, f"{out_dir}/ckpt.pt")
 
 # fixing some hyperparams to sensible defaults
 lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla
@@ -164,6 +221,34 @@ ctx = (
     if device_type == "cpu"
     else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
+
+# tokenizer for sample generation
+if dataset == "simplestories":
+    from simplestories import get_tokenizer_model_path
+else:
+    from tinystories import get_tokenizer_model_path
+_tok_model_path = get_tokenizer_model_path(vocab_size if vocab_source == "custom" else 0)
+from tokenizer import Tokenizer as _Tokenizer
+sample_tokenizer = _Tokenizer(tokenizer_model=_tok_model_path)
+
+sample_prompts = ["Once upon a time", "The cat", "A little girl named"]
+sample_interval = 500  # generate samples every N steps
+
+@torch.no_grad()
+def generate_samples(model, raw_model, prompts, max_new_tokens=150, temperature=0.8, top_k=50):
+    was_training = model.training
+    model.eval()
+    results = []
+    for prompt in prompts:
+        tokens = sample_tokenizer.encode(prompt.lower() if vocab_source == "custom" else prompt, bos=True, eos=False)
+        x = torch.tensor(tokens, dtype=torch.long, device=device)[None, ...]
+        with ctx:
+            y = raw_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+        text = sample_tokenizer.decode(y[0].tolist())
+        results.append(text)
+    if was_training:
+        model.train()
+    return results
 
 # task-specific setup
 iter_batches = partial(
@@ -361,17 +446,25 @@ while True:
         if losses["val"] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses["val"]
             if iter_num > 0:
-                checkpoint = {
-                    "model": raw_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "model_args": model_args,
-                    "iter_num": iter_num,
-                    "best_val_loss": best_val_loss,
-                    "config": config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+                save_checkpoint(iter_num, best_val_loss, model_args, raw_model, optimizer, config, out_dir)
                 model_export(raw_model, os.path.join(out_dir, "model.bin"), version=3)
+    # periodic checkpoint save (independent of eval)
+    if save_interval > 0 and iter_num > 0 and iter_num % save_interval == 0 and iter_num % eval_interval != 0 and master_process:
+        save_checkpoint(iter_num, best_val_loss, model_args, raw_model, optimizer, config, out_dir)
+    # periodic sample generation
+    if iter_num > 0 and iter_num % sample_interval == 0 and master_process:
+        samples = generate_samples(model, raw_model, sample_prompts)
+        print(f"--- samples at step {iter_num} ---")
+        for prompt, text in zip(sample_prompts, samples):
+            print(f"[{prompt}]: {text[:300]}")
+        if wandb_log:
+            try:
+                table = wandb.Table(columns=["prompt", "generated_text"])
+                for prompt, text in zip(sample_prompts, samples):
+                    table.add_data(prompt, text)
+                wandb.log({"samples": table, "iter": iter_num}, step=iter_num)
+            except Exception as e:
+                print(f"logging samples to wandb failed: {e}")
     if iter_num == 0 and eval_only:
         break
 

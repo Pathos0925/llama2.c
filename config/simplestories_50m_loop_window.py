@@ -12,7 +12,7 @@
 
 # data
 dataset = "simplestories"
-batch_size = 16
+batch_size = 32
 max_seq_len = 1024
 vocab_size = 4096
 vocab_source = "custom"
@@ -74,9 +74,16 @@ eval_iters = 50
 
 # system
 compile = True
-num_workers = 4
+num_workers = 12
+
+# checkpointing
+save_interval = 500
+r2_upload = True
+r2_endpoint = "https://9b4c7692e09c1fcfe021662409d4e695.r2.cloudflarestorage.com"
+r2_bucket = "jarvis"
+r2_prefix = "loop-cached-reasoning/"
 
 # wandb
-wandb_log = False
+wandb_log = True
 wandb_project = "loop-cached-reasoning"
 wandb_run_name = "50m-loop2-window128-simplestories"

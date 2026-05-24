@@ -169,6 +169,22 @@ wandb_run_name = "my_run"
 
 Logged metrics include train/val loss, learning rate, MFU, and iteration time. When LoopLM is enabled, per-loop-step losses, exit probability distribution, mean exit step, and KL beta are also logged.
 
+Sample text generations are logged as wandb Tables every `sample_interval` steps (default 500), letting you watch output quality improve during training.
+
+## Checkpoint saving and R2 upload
+
+Checkpoints can be saved periodically and uploaded to Cloudflare R2 (S3-compatible) for resilience on interruptible/spot instances. Both a rolling `ckpt.pt` and a versioned `ckpt_step{N}.pt` are uploaded each time.
+
+```python
+save_interval = 500         # save every N steps (0 = only at eval)
+r2_upload = True
+r2_endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+r2_bucket = "my-bucket"
+r2_prefix = "my-project/"   # path prefix in bucket
+```
+
+R2 credentials (`access_key_id` and `secret_access_key`) are read from a `.env` file in the project root. Checkpoints are also saved locally to `out_dir` as before.
+
 ## Flash Linear Attention (fla)
 
 The linear attention layers can optionally use fused Triton kernels from the [`flash-linear-attention`](https://github.com/sustcsonglin/flash-linear-attention) library for significantly faster training. When `fla` is installed, it is used automatically; otherwise the naive PyTorch implementation is used as a fallback.
