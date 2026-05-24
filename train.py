@@ -445,14 +445,14 @@ while True:
                 print(f"logging to wandb failed: {e}")
         if losses["val"] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses["val"]
+            save_checkpoint(iter_num, best_val_loss, model_args, raw_model, optimizer, config, out_dir)
             if iter_num > 0:
-                save_checkpoint(iter_num, best_val_loss, model_args, raw_model, optimizer, config, out_dir)
                 model_export(raw_model, os.path.join(out_dir, "model.bin"), version=3)
     # periodic checkpoint save (independent of eval)
     if save_interval > 0 and iter_num > 0 and iter_num % save_interval == 0 and iter_num % eval_interval != 0 and master_process:
         save_checkpoint(iter_num, best_val_loss, model_args, raw_model, optimizer, config, out_dir)
     # periodic sample generation
-    if iter_num > 0 and iter_num % sample_interval == 0 and master_process:
+    if iter_num % sample_interval == 0 and master_process:
         samples = generate_samples(model, raw_model, sample_prompts)
         print(f"--- samples at step {iter_num} ---")
         for prompt, text in zip(sample_prompts, samples):
