@@ -756,3 +756,10 @@ data/ss_tok4096/train_211.bin
 wandb/debug-internal.log
 wandb/debug.log
 wandb/latest-run
+__pycache__/
+out_*/
+*.pt
+*.bin
+data/
+wandb/
+training.log

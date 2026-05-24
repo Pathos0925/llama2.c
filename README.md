@@ -223,8 +223,9 @@ python simplestories.py download
 python simplestories.py train_vocab --vocab_size=4096
 python simplestories.py pretokenize --vocab_size=4096
 
-# To include conversation data, place simple_conversations_filtered.jsonl in data/
-# before running train_vocab and pretokenize — it is picked up automatically.
+# To include conversation data:
+cp simple_conversations_filtered.jsonl data/
+# Then run train_vocab and pretokenize as above — it is picked up automatically.
 ```
 
 ## config files
@@ -238,7 +239,7 @@ Training configs live in the `config/` directory:
 | `qwen3_simplestories_4k.py` | SimpleStories with 4K custom tokenizer |
 | `qwen3_simplestories_4k_mc.py` | + Memory Caching (SSC) |
 | `qwen3_simplestories_4k_loop_mc.py` | + LoopLM + Loop-Cached Reasoning |
-| `simplestories_50m_loop_window.py` | 50M param LoopLM + windowed attention |
+| `simplestories_50m_loop_window_B200.py` | 50M param LoopLM + windowed attention (B200-tuned) |
 
 You can also override individual params: `python train.py config/qwen3_suggested.py --max_iters=50000`
 
