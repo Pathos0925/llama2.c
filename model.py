@@ -33,7 +33,7 @@ class ModelArgs:
     # layer type pattern: "full", "window", or "linear", repeating. None = all full attention.
     layer_types: Optional[Tuple[str, ...]] = None
     # windowed (sliding window) attention
-    window_size: int = 256  # number of past tokens each position can attend to
+    window_size: int = 256  # attention window size (including current position)
     # linear attention (Gated Delta Net) params
     linear_num_key_heads: int = 16
     linear_num_value_heads: int = 16
@@ -267,8 +267,10 @@ class Attention(nn.Module):
 
 
 def l2norm(x, dim=-1, eps=1e-6):
-    """L2 normalize along dim."""
-    return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    """L2 normalize along dim, computed in fp32 for precision."""
+    x_fp32 = x.float()
+    x_fp32 = x_fp32 * torch.rsqrt((x_fp32 * x_fp32).sum(dim=dim, keepdim=True) + eps)
+    return x_fp32.to(x.dtype)
 
 
 def torch_causal_conv1d(hidden_states, weight, bias=None):
@@ -383,7 +385,7 @@ class LinearAttention(nn.Module):
 
         # Learnable time-step and decay parameters
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
-        A = torch.empty(self.num_v_heads).uniform_(0, 16)
+        A = torch.empty(self.num_v_heads).uniform_(1, 16)
         self.A_log = nn.Parameter(torch.log(A))
 
         # Gated RMSNorm after attention
@@ -572,10 +574,10 @@ class LinearAttention(nn.Module):
 
         if not mc_enabled:
             # Standard path: no memory caching
-            if HAS_FLA:
-                _dt = torch.bfloat16 if query.is_cuda else torch.float32
+            if HAS_FLA and value.dtype != torch.float32:
+                _dt = value.dtype
                 core_out, final_state = fla_chunk_gated_delta_rule(
-                    query.to(_dt), key.to(_dt), value.to(_dt),
+                    query.to(_dt), key.to(_dt), value,
                     g=g.to(_dt), beta=beta.to(_dt),
                     initial_state=None, output_final_state=need_final_state,
                 )
@@ -614,10 +616,10 @@ class LinearAttention(nn.Module):
                 beta_seg = beta[:, start:end]
 
                 # Run gated delta rule on this segment
-                if HAS_FLA:
-                    _dt = torch.bfloat16 if q_seg.is_cuda else torch.float32
+                if HAS_FLA and v_seg.dtype != torch.float32:
+                    _dt = v_seg.dtype
                     online_out, final_state = fla_chunk_gated_delta_rule(
-                        q_seg.to(_dt), k_seg.to(_dt), v_seg.to(_dt),
+                        q_seg.to(_dt), k_seg.to(_dt), v_seg,
                         g=g_seg.to(_dt), beta=beta_seg.to(_dt),
                         initial_state=prev_state, output_final_state=True,
                     )
@@ -781,6 +783,10 @@ class Transformer(nn.Module):
         # Build layer type pattern: default is 3 linear + 1 full, repeating
         if params.layer_types is not None:
             layer_types = list(params.layer_types)
+            assert len(layer_types) == params.n_layers, \
+                f"layer_types length {len(layer_types)} != n_layers {params.n_layers}"
+            assert all(t in {"full", "window", "linear"} for t in layer_types), \
+                f"invalid layer type, must be full/window/linear, got {set(layer_types)}"
         else:
             pattern = ("linear", "linear", "linear", "full")
             layer_types = [pattern[i % len(pattern)] for i in range(params.n_layers)]
@@ -813,6 +819,7 @@ class Transformer(nn.Module):
         # LoopLM: exit gate and loop-axis MC router projections
         if params.loop_max_steps > 1:
             self.exit_gate = ExitGate(params.dim)
+            self._init_weights(self.exit_gate.proj)
             # Loop-axis MC: add separate router projection to each linear attention layer
             if params.loop_mc_enabled and params.mc_segment_size > 0:
                 for layer in self.layers:
@@ -823,6 +830,7 @@ class Transformer(nn.Module):
                         la.loop_mc_u_proj = nn.Linear(
                             params.dim, la.num_v_heads * la.head_k_dim, bias=False
                         )
+                        self._init_weights(la.loop_mc_u_proj)
 
         # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_loss = None
@@ -841,7 +849,7 @@ class Transformer(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def _run_layers(self, h, freqs_cos, freqs_sin, loop_cache=None):
-        """Run all transformer layers once. Returns normed output.
+        """Run all transformer layers once.
 
         Args:
             h: [B, T, D] input hidden states
@@ -849,7 +857,7 @@ class Transformer(nn.Module):
             loop_cache: dict of {layer_idx: (cached_states, cached_contexts)} for loop-MC,
                         or None to disable loop-axis MC
         Returns:
-            h_out: [B, T, D] normed output
+            (normed, pre_norm): normed output for logits, pre-norm for loop carry
         """
         blocks = [h]
         partial_block = h
@@ -861,7 +869,7 @@ class Transformer(nn.Module):
                 blocks, partial_block, freqs_cos, freqs_sin,
                 loop_cached_states=lcs, loop_cached_contexts=lcc,
             )
-        return self.norm(partial_block)
+        return self.norm(partial_block), partial_block
 
     def _collect_loop_states(self):
         """Extract final states and contexts from all linear attention layers.
@@ -883,7 +891,7 @@ class Transformer(nn.Module):
 
         if self.params.loop_max_steps <= 1:
             # ---- Standard non-looped path (unchanged) ----
-            h = self._run_layers(h, freqs_cos, freqs_sin)
+            h, _ = self._run_layers(h, freqs_cos, freqs_sin)
 
             if targets is not None:
                 logits = self.output(h)
@@ -899,8 +907,8 @@ class Transformer(nn.Module):
         # ---- LoopLM path ----
         T_max = self.params.loop_max_steps
         loop_mc_on = (self.params.loop_mc_enabled and self.params.mc_segment_size > 0
-                      and hasattr(self.layers[0].attention, 'loop_mc_u_proj')
-                      if self.layers[0].layer_type == "linear" else False)
+                      and any(l.layer_type == "linear" and hasattr(l.attention, 'loop_mc_u_proj')
+                              for l in self.layers))
         detach_loop = self.params.loop_mc_detach
 
         loop_losses = []       # per-step [B, T] losses (training only)
@@ -920,7 +928,7 @@ class Transformer(nn.Module):
                 }
 
             # Run all layers (each loop sees the same weights — weight tying)
-            h_out = self._run_layers(h, freqs_cos, freqs_sin, loop_cache=loop_cache)
+            h_out, h_pre_norm = self._run_layers(h, freqs_cos, freqs_sin, loop_cache=loop_cache)
 
             # Exit gate
             lambda_t = self.exit_gate(h_out)  # [B, T]
@@ -953,12 +961,12 @@ class Transformer(nn.Module):
                 p_t = lambda_t * survival
                 survival = survival * (1 - lambda_t)
                 cdf = 1.0 - survival
-                # Exit when all tokens across batch exceed threshold
-                if cdf.min().item() >= self.params.loop_exit_threshold:
+                # Exit when last token across batch exceeds threshold
+                if cdf[:, -1].min().item() >= self.params.loop_exit_threshold:
                     break
 
-            # Update hidden state for next loop iteration
-            h = h_out
+            # Update hidden state for next loop iteration (pre-norm to avoid double-norming)
+            h = h_pre_norm
 
         # ---- Compute final loss ----
         if targets is not None:
@@ -986,14 +994,17 @@ class Transformer(nn.Module):
                     # BCE: w*log(1-lambda) + (1-w)*log(lambda)
                     bce = w_t * torch.log(1 - lam + 1e-8) + (1 - w_t) * torch.log(lam + 1e-8)
                     adaptive_losses.append(-bce.mean())
-                self.last_loss = torch.stack(adaptive_losses).mean() if adaptive_losses else torch.tensor(0.0)
+                self.last_loss = torch.stack(adaptive_losses).mean() if adaptive_losses else torch.zeros((), device=tokens.device)
             else:
-                # Stage I: entropy-regularized expected loss
-                expected_loss = (exit_probs.detach() * losses_stack).sum(dim=0).mean()
+                # Stage I: split-gradient expected loss
+                # LM loss: gradient to LM params only (gate detached)
+                lm_loss = (exit_probs.detach() * losses_stack).sum(dim=0).mean()
+                # Gate loss: gradient to exit gate only (losses detached)
+                gate_loss = (exit_probs * losses_stack.detach()).sum(dim=0).mean()
                 # Entropy of exit distribution
                 log_probs = torch.log(exit_probs + 1e-8)
                 entropy = -(exit_probs * log_probs).sum(dim=0).mean()
-                self.last_loss = expected_loss - self.params.loop_kl_beta * entropy
+                self.last_loss = lm_loss + gate_loss - self.params.loop_kl_beta * entropy
 
             # Store diagnostics
             self.loop_step_losses = [l.mean().item() for l in loop_losses]

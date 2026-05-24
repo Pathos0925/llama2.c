@@ -2,7 +2,7 @@
 # Usage: python train.py config/simplestories_50m_loop_window.py
 #
 # Architecture: 12 physical layers (linear, linear, window, full) x3
-# With loop_max_steps=4, effective depth = 48 layers
+# With loop_max_steps=2, effective depth = 24 layers
 # No memory caching (mc_segment_size=0, loop_mc_enabled=False)
 #
 # Prepare data first:
@@ -12,7 +12,7 @@
 
 # data
 dataset = "simplestories"
-batch_size = 24
+batch_size = 16
 max_seq_len = 1024
 vocab_size = 4096
 vocab_source = "custom"
@@ -47,7 +47,7 @@ attnres_block_size = 4
 # memory caching -- disabled
 mc_segment_size = 0
 
-# LoopLM -- 4 loop iterations, no caching
+# LoopLM -- 2 loop iterations, no caching
 loop_max_steps = 2
 loop_kl_beta = 0.1
 loop_exit_threshold = 0.9
@@ -60,12 +60,12 @@ weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.99
 grad_clip = 1.0
-gradient_accumulation_steps = 6
+gradient_accumulation_steps = 8
 
 # lr schedule
 decay_lr = True
 warmup_iters = 500
-max_iters = 100000
+max_iters = 17000
 
 # I/O
 out_dir = "out_simplestories_50m_loop_window"
@@ -79,4 +79,4 @@ num_workers = 4
 # wandb
 wandb_log = False
 wandb_project = "loop-cached-reasoning"
-wandb_run_name = "50m-loop4-window128-simplestories"
+wandb_run_name = "50m-loop2-window128-simplestories"

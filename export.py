@@ -215,7 +215,7 @@ def version3_export(model, filepath):
     out_file.write(struct.pack('B', int(shared_classifier)))
     # 6) layer types: 0=linear, 1=full
     for layer in model.layers:
-        out_file.write(struct.pack('B', 1 if layer.layer_type == "full" else 0))
+        out_file.write(struct.pack('B', 0 if layer.layer_type == "linear" else 1))
     # pad header to 512 bytes
     pad = 512 - out_file.tell()
     assert pad >= 0, f"Header too large, need {out_file.tell()} bytes"
@@ -230,7 +230,7 @@ def version3_export(model, filepath):
         # attention norm (shared by both types)
         serialize_fp32(out_file, layer.attention_norm.weight)
 
-        if layer.layer_type == "full":
+        if layer.layer_type != "linear":
             attn = layer.attention
             serialize_fp32(out_file, attn.wq.weight)
             serialize_fp32(out_file, attn.wk.weight)
@@ -317,7 +317,7 @@ def version4_export(model, filepath, group_size=64):
         p.linear_conv_kernel_dim, attnres_block_size))
     out_file.write(struct.pack('B', int(shared_classifier)))
     for layer in model.layers:
-        out_file.write(struct.pack('B', 1 if layer.layer_type == "full" else 0))
+        out_file.write(struct.pack('B', 0 if layer.layer_type == "linear" else 1))
     out_file.write(struct.pack('i', group_size))  # group size for quantization
     pad = 512 - out_file.tell()
     assert pad >= 0, f"Header too large, need {out_file.tell()} bytes"
@@ -332,7 +332,7 @@ def version4_export(model, filepath, group_size=64):
         # attention norm (fp32)
         serialize_fp32(out_file, layer.attention_norm.weight)
 
-        if layer.layer_type == "full":
+        if layer.layer_type != "linear":
             attn = layer.attention
             serialize_q80(out_file, attn.wq.weight)
             serialize_q80(out_file, attn.wk.weight)
