@@ -9,6 +9,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_chunk_gated_delta_rule
+    HAS_FLA = True
+except ImportError:
+    HAS_FLA = False
+
 @dataclass
 class ModelArgs:
     dim: int = 4096
@@ -24,8 +30,10 @@ class ModelArgs:
     dropout: float = 0.0
     rope_base: float = 10_000_000.0
     partial_rotary_factor: float = 0.25
-    # layer type pattern: "full" or "linear", repeating. None = all full attention.
+    # layer type pattern: "full", "window", or "linear", repeating. None = all full attention.
     layer_types: Optional[Tuple[str, ...]] = None
+    # windowed (sliding window) attention
+    window_size: int = 256  # number of past tokens each position can attend to
     # linear attention (Gated Delta Net) params
     linear_num_key_heads: int = 16
     linear_num_value_heads: int = 16
@@ -158,8 +166,9 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 class Attention(nn.Module):
-    """Qwen3.5-style full attention with gated Q projection and QK norm."""
-    def __init__(self, args: ModelArgs):
+    """Qwen3.5-style full attention with gated Q projection and QK norm.
+    Supports optional sliding window when window_size > 0."""
+    def __init__(self, args: ModelArgs, window_size: int = 0):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         assert args.n_heads % self.n_kv_heads == 0
@@ -181,12 +190,20 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
+        self.window_size = window_size
 
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+
+        if not self.flash or window_size > 0:
             mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
             mask = torch.triu(mask, diagonal=1)
+            if window_size > 0:
+                too_far = torch.tril(
+                    torch.ones(args.max_seq_len, args.max_seq_len), diagonal=-window_size
+                )
+                mask = mask.masked_fill(too_far.bool().unsqueeze(0).unsqueeze(0), float("-inf"))
             self.register_buffer("mask", mask)
 
     def forward(
@@ -222,10 +239,14 @@ class Attention(nn.Module):
         xv = repeat_kv(xv.transpose(1, 2), self.n_rep).transpose(1, 2)
 
         # attention
-        if self.flash:
+        if self.flash and self.window_size == 0:
             output = torch.nn.functional.scaled_dot_product_attention(
                 xq, xk, xv, attn_mask=None,
                 dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        elif self.flash:
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=self.mask[:, :, :seqlen, :seqlen],
+                dropout_p=self.dropout if self.training else 0.0, is_causal=False)
         else:
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             assert hasattr(self, 'mask')
@@ -551,10 +572,18 @@ class LinearAttention(nn.Module):
 
         if not mc_enabled:
             # Standard path: no memory caching
-            core_out, final_state = chunk_gated_delta_rule(
-                query, key, value, g=g, beta=beta,
-                initial_state=None, output_final_state=need_final_state,
-            )
+            if HAS_FLA:
+                _dt = torch.bfloat16 if query.is_cuda else torch.float32
+                core_out, final_state = fla_chunk_gated_delta_rule(
+                    query.to(_dt), key.to(_dt), value.to(_dt),
+                    g=g.to(_dt), beta=beta.to(_dt),
+                    initial_state=None, output_final_state=need_final_state,
+                )
+            else:
+                core_out, final_state = chunk_gated_delta_rule(
+                    query, key, value, g=g, beta=beta,
+                    initial_state=None, output_final_state=need_final_state,
+                )
             # Store for loop-axis MC extraction
             self.last_final_state = final_state
             self.last_full_context = key.sum(dim=1)  # [B, H, k]
@@ -585,10 +614,18 @@ class LinearAttention(nn.Module):
                 beta_seg = beta[:, start:end]
 
                 # Run gated delta rule on this segment
-                online_out, final_state = chunk_gated_delta_rule(
-                    q_seg, k_seg, v_seg, g=g_seg, beta=beta_seg,
-                    initial_state=prev_state, output_final_state=True,
-                )
+                if HAS_FLA:
+                    _dt = torch.bfloat16 if q_seg.is_cuda else torch.float32
+                    online_out, final_state = fla_chunk_gated_delta_rule(
+                        q_seg.to(_dt), k_seg.to(_dt), v_seg.to(_dt),
+                        g=g_seg.to(_dt), beta=beta_seg.to(_dt),
+                        initial_state=prev_state, output_final_state=True,
+                    )
+                else:
+                    online_out, final_state = chunk_gated_delta_rule(
+                        q_seg, k_seg, v_seg, g=g_seg, beta=beta_seg,
+                        initial_state=prev_state, output_final_state=True,
+                    )
                 # online_out: [B, seg_len, num_v_heads, head_v_dim]
                 # final_state: [B, num_v_heads, head_k_dim, head_v_dim]
 
@@ -663,6 +700,8 @@ class TransformerBlock(nn.Module):
 
         if layer_type == "full":
             self.attention = Attention(args)
+        elif layer_type == "window":
+            self.attention = Attention(args, window_size=args.window_size)
         else:
             self.attention = LinearAttention(args, layer_idx=layer_id)
 
@@ -698,7 +737,7 @@ class TransformerBlock(nn.Module):
                 h = self.attn_res(blocks, partial_block)
 
             # Attention sub-layer
-            if self.layer_type == "full":
+            if self.layer_type != "linear":
                 attn_out = self.attention(self.attention_norm(h), freqs_cos, freqs_sin)
             else:
                 attn_out = self.attention(self.attention_norm(h), lcs, lcc)
@@ -719,7 +758,7 @@ class TransformerBlock(nn.Module):
             return blocks, partial_block
         else:
             # Standard residual path (attnres disabled)
-            if self.layer_type == "full":
+            if self.layer_type != "linear":
                 h = partial_block + self.attention(self.attention_norm(partial_block), freqs_cos, freqs_sin)
             else:
                 h = partial_block + self.attention(self.attention_norm(partial_block), lcs, lcc)

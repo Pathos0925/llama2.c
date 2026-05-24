@@ -60,7 +60,10 @@ dropout = 0.0
 rope_base = 10_000_000.0
 partial_rotary_factor = 0.25
 # layer_types: 3 linear + 1 full, repeating. None = use default pattern.
+# Use "window" for sliding window attention layers.
 layer_types = None
+# windowed (sliding window) attention
+window_size = 256  # tokens each position can attend to in "window" layers
 # linear attention params (scaled down for TinyStories)
 linear_num_key_heads = 4
 linear_num_value_heads = 4
@@ -97,6 +100,7 @@ warmup_iters = 1000  # how many steps to warm up for
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
+num_workers = 0  # data loading workers (0 = main process only)
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -169,7 +173,7 @@ iter_batches = partial(
     vocab_size=vocab_size,
     vocab_source=vocab_source,
     device=device,
-    num_workers=0,
+    num_workers=num_workers,
 )
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -190,6 +194,7 @@ model_args = dict(
     rope_base=rope_base,
     partial_rotary_factor=partial_rotary_factor,
     layer_types=layer_types,
+    window_size=window_size,
     linear_num_key_heads=linear_num_key_heads,
     linear_num_value_heads=linear_num_value_heads,
     linear_key_head_dim=linear_key_head_dim,
@@ -221,7 +226,8 @@ elif init_from == "resume":
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "head_dim", "vocab_size",
                "multiple_of", "max_seq_len", "rope_base", "partial_rotary_factor",
-               "layer_types", "linear_num_key_heads", "linear_num_value_heads",
+               "layer_types", "window_size",
+               "linear_num_key_heads", "linear_num_value_heads",
                "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim",
                "attnres_block_size",
                "mc_segment_size", "mc_ssc_top_k", "mc_detach_cached_states",

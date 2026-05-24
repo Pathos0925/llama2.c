@@ -57,10 +57,23 @@ The model architecture has been updated from Llama 2 to Qwen3.5. Key differences
 | **RoPE** | Full head_dim, theta=10K | Partial rotary (25%), theta=10M |
 | **Full attention** | Standard Q projection | Gated Q (2x width + sigmoid gate), QK norm |
 | **Linear attention** | N/A | Gated Delta Net with causal depthwise conv |
-| **Layer pattern** | All identical | Hybrid: 3 linear + 1 full attention, repeating |
+| **Windowed attention** | N/A | Sliding window causal attention (configurable window size) |
+| **Layer pattern** | All identical | Hybrid: linear, window, and full attention, repeating |
 | **FFN** | SwiGLU | SwiGLU (unchanged) |
 
-The hybrid attention design alternates between lightweight linear attention layers (Gated Delta Net) and full softmax attention layers. Linear attention layers use a delta rule recurrence instead of the quadratic attention matrix, making them more efficient for long sequences.
+The hybrid attention design supports three layer types: **linear** (Gated Delta Net, O(n) recurrence), **window** (sliding window causal attention, O(n·w) where w is window size), and **full** (standard softmax attention, O(n²)). These can be mixed freely via the `layer_types` config.
+
+### Windowed (Sliding Window) Attention
+
+The `"window"` layer type implements sliding window causal attention. Each position can only attend to the nearest `window_size` tokens (including itself), reducing the quadratic cost of full attention while preserving local context. This is useful for long sequences where full attention is too expensive but linear attention alone may lose fine-grained local information.
+
+```python
+# Mix windowed attention into the layer pattern
+layer_types = ("linear", "linear", "window", "full")  # repeating pattern
+window_size = 128  # each windowed layer attends to 128 past tokens
+```
+
+Windowed attention uses the same Qwen3.5-style gated Q projection and QK norm as full attention.
 
 ### Block Attention Residuals
 
@@ -156,6 +169,16 @@ wandb_run_name = "my_run"
 
 Logged metrics include train/val loss, learning rate, MFU, and iteration time. When LoopLM is enabled, per-loop-step losses, exit probability distribution, mean exit step, and KL beta are also logged.
 
+## Flash Linear Attention (fla)
+
+The linear attention layers can optionally use fused Triton kernels from the [`flash-linear-attention`](https://github.com/sustcsonglin/flash-linear-attention) library for significantly faster training. When `fla` is installed, it is used automatically; otherwise the naive PyTorch implementation is used as a fallback.
+
+```bash
+pip install flash-linear-attention
+```
+
+On an H100 with a 50M parameter model, `fla` provides roughly a **4x throughput improvement** over the naive implementation.
+
 ## datasets
 
 Two datasets are supported:
@@ -185,6 +208,7 @@ Training configs live in the `config/` directory:
 | `qwen3_simplestories_4k.py` | SimpleStories with 4K custom tokenizer |
 | `qwen3_simplestories_4k_mc.py` | + Memory Caching (SSC) |
 | `qwen3_simplestories_4k_loop_mc.py` | + LoopLM + Loop-Cached Reasoning |
+| `simplestories_50m_loop_window.py` | 50M param LoopLM + windowed attention |
 
 You can also override individual params: `python train.py config/qwen3_suggested.py --max_iters=50000`
 
