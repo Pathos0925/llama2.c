@@ -105,8 +105,15 @@ def train_vocab(vocab_size):
             with open(shard, "r") as f:
                 data = json.load(f)
             for example in data:
-                # lowercase for custom tokenizer training so vocab is all lowercase
-                of.write(example["story"].lower() + "\n")
+                of.write(example["story"] + "\n")
+        # include conversation data if available
+        conv_file = os.path.join(DATA_CACHE_DIR, "simple_conversations_filtered.jsonl")
+        if os.path.exists(conv_file):
+            print(f"Including conversation data from {conv_file}")
+            with open(conv_file, "r") as f:
+                for line in f:
+                    ex = json.loads(line)
+                    of.write(ex["conversation"] + "\n")
     print(f"Size is: {os.path.getsize(tiny_file) / 1024 / 1024:.2f} MB")
 
     print("Training the vocab...")
@@ -138,14 +145,17 @@ def process_shard(args, vocab_size):
     shard_id, shard = args
     tokenizer_model = get_tokenizer_model_path(vocab_size)
     enc = Tokenizer(tokenizer_model)
-    with open(shard, "r") as f:
-        data = json.load(f)
     all_tokens = []
+    if shard.endswith(".jsonl"):
+        with open(shard, "r") as f:
+            data = [json.loads(line) for line in f]
+        text_key = "conversation"
+    else:
+        with open(shard, "r") as f:
+            data = json.load(f)
+        text_key = "story"
     for example in tqdm(data, position=shard_id):
-        text = example["story"]
-        text = text.strip()
-        if vocab_size > 0:
-            text = text.lower()  # custom tokenizer was trained on lowercased text
+        text = example[text_key].strip()
         tokens = enc.encode(text, bos=True, eos=False)
         all_tokens.extend(tokens)
     all_tokens = np.array(all_tokens, dtype=np.uint16)
@@ -155,7 +165,8 @@ def process_shard(args, vocab_size):
     else:
         bin_dir = os.path.join(DATA_CACHE_DIR, f"ss_tok{vocab_size}")
         shard_basename = os.path.basename(shard)
-        bin_basename = shard_basename.replace(".json", ".bin")
+        base, _ = os.path.splitext(shard_basename)
+        bin_basename = base + ".bin"
         tokenized_filename = os.path.join(bin_dir, bin_basename)
     with open(tokenized_filename, "wb") as f:
         f.write(all_tokens.tobytes())
@@ -167,6 +178,12 @@ def pretokenize(vocab_size):
     data_dir = os.path.join(DATA_CACHE_DIR, "SimpleStories")
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
     assert len(shard_filenames) > 0, f"No JSON shards found in {data_dir}. Run 'download' first."
+
+    # include conversation data if available
+    conv_file = os.path.join(DATA_CACHE_DIR, "simple_conversations_filtered.jsonl")
+    if os.path.exists(conv_file):
+        print(f"Including conversation data from {conv_file}")
+        shard_filenames.append(conv_file)
 
     if vocab_size > 0:
         bin_dir = os.path.join(DATA_CACHE_DIR, f"ss_tok{vocab_size}")
@@ -203,9 +220,9 @@ class PretokDataset(torch.utils.data.IterableDataset):
             bin_dir = os.path.join(DATA_CACHE_DIR, f"ss_tok{self.vocab_size}")
             shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
 
-        # test split uses shards starting with "test_", train uses "train_"
+        # test split uses shards starting with "test_", train uses everything else
         if self.split == "train":
-            shard_filenames = [s for s in shard_filenames if "train_" in os.path.basename(s)]
+            shard_filenames = [s for s in shard_filenames if "test_" not in os.path.basename(s)]
         else:
             shard_filenames = [s for s in shard_filenames if "test_" in os.path.basename(s)]
         assert len(shard_filenames) > 0, f"No bin files found for split={self.split}"

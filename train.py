@@ -231,7 +231,7 @@ _tok_model_path = get_tokenizer_model_path(vocab_size if vocab_source == "custom
 from tokenizer import Tokenizer as _Tokenizer
 sample_tokenizer = _Tokenizer(tokenizer_model=_tok_model_path)
 
-sample_prompts = ["Once upon a time", "The cat", "A little girl named"]
+sample_prompts = ["Once upon a time", "The cat", "A little girl named", "<person1> Hey, tell me a story!\n\n<person2>"]
 sample_interval = 500  # generate samples every N steps
 
 @torch.no_grad()
@@ -240,7 +240,7 @@ def generate_samples(model, raw_model, prompts, max_new_tokens=150, temperature=
     model.eval()
     results = []
     for prompt in prompts:
-        tokens = sample_tokenizer.encode(prompt.lower() if vocab_source == "custom" else prompt, bos=True, eos=False)
+        tokens = sample_tokenizer.encode(prompt, bos=True, eos=False)
         x = torch.tensor(tokens, dtype=torch.long, device=device)[None, ...]
         with ctx:
             y = raw_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
