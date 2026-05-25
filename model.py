@@ -30,10 +30,13 @@ class ModelArgs:
     dropout: float = 0.0
     rope_base: float = 10_000_000.0
     partial_rotary_factor: float = 0.25
-    # layer type pattern: "full", "window", or "linear", repeating. None = all full attention.
+    # layer type pattern: "full", "window", "csa", or "linear", repeating.
     layer_types: Optional[Tuple[str, ...]] = None
     # windowed (sliding window) attention
     window_size: int = 256  # attention window size (including current position)
+    # Compressed Attention (CA) params
+    csa_stride: int = 4            # compression stride (compress every N tokens into 1)
+    csa_local_window: int = 32     # local fine-grained window in addition to compressed
     # linear attention (Gated Delta Net) params
     linear_num_key_heads: int = 16
     linear_num_value_heads: int = 16
@@ -43,6 +46,8 @@ class ModelArgs:
     # Block Attention Residuals: 0 = disabled (standard residuals)
     # block_size counts sub-layers (attn+mlp = 2 per transformer layer)
     attnres_block_size: int = 0
+    # Hyper-Connections: learned per-layer residual scaling (0 = disabled, use standard residuals)
+    hyper_connections: bool = False
     # Memory Caching (MC) -- only affects LinearAttention layers
     # 0 = disabled; >0 = segment size in tokens for memory caching
     mc_segment_size: int = 0
@@ -104,6 +109,191 @@ class BlockAttnRes(nn.Module):
         weights = torch.softmax(logits, dim=0)
         h = torch.einsum('n b t, n b t d -> b t d', weights, V)
         return h
+
+
+class HyperConnection(nn.Module):
+    """Learned per-layer residual scaling inspired by DeepSeek V4 hyper-connections.
+
+    Instead of h = h + sublayer(h), computes:
+        h = (1 + residual_scale) * h + (1 + sublayer_scale) * sublayer(h)
+
+    Both scale vectors are zero-initialized so the model starts as standard residual
+    but can learn optimal per-dimension residual balance during training.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.residual_scale = nn.Parameter(torch.zeros(dim))
+        self.sublayer_scale = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, residual: torch.Tensor, sublayer_output: torch.Tensor) -> torch.Tensor:
+        return (1.0 + self.residual_scale) * residual + (1.0 + self.sublayer_scale) * sublayer_output
+
+
+class CompressedSparseAttention(nn.Module):
+    """Compressed Sparse Attention (CSA) inspired by DeepSeek V4.
+
+    Compresses the KV sequence by a learned stride-N pooling, then performs
+    sparse attention over the compressed representations plus a local window
+    for fine-grained detail. This achieves sub-quadratic cost while preserving
+    both long-range and local context.
+
+    Architecture:
+    1. Learned compression: stride-N depthwise conv + linear produces compressed KV
+    2. Full causal attention over compressed KV (length T/stride)
+    3. Local causal window attention over raw tokens (window_size)
+    4. Gated combination of compressed and local outputs
+    """
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        self.n_heads = args.n_heads
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.head_dim = args.head_dim if args.head_dim is not None else args.dim // args.n_heads
+        self.d_out = self.n_heads * self.head_dim
+        self.stride = args.csa_stride
+        self.local_window = args.csa_local_window
+
+        # Q projection (gated, same as full attention)
+        self.wq = nn.Linear(args.dim, self.d_out * 2, bias=False)
+        # KV projections (shared for both compressed and local paths)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        # Output
+        self.wo = nn.Linear(self.d_out, args.dim, bias=False)
+
+        # QK norm
+        self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
+
+        # Learned KV compressor: average pool + linear refinement
+        self.compress_k = nn.Linear(self.n_kv_heads * self.head_dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.compress_v = nn.Linear(self.n_kv_heads * self.head_dim, self.n_kv_heads * self.head_dim, bias=False)
+
+        # Gate to blend compressed and local attention outputs
+        self.blend_gate = nn.Linear(args.dim, self.d_out, bias=False)
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+
+        # Local window mask
+        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+        mask = torch.triu(mask, diagonal=1)
+        too_far = torch.tril(
+            torch.ones(args.max_seq_len, args.max_seq_len), diagonal=-self.local_window
+        )
+        mask = mask.masked_fill(too_far.bool().unsqueeze(0).unsqueeze(0), float("-inf"))
+        self.register_buffer("local_mask", mask)
+
+        # Precompute compressed attention causal mask
+        max_comp_len = (args.max_seq_len + self.stride - 1) // self.stride
+        comp_mask = torch.full((args.max_seq_len, max_comp_len), float("-inf"))
+        for j in range(max_comp_len):
+            comp_mask[(j + 1) * self.stride:, j] = 0.0
+        self.register_buffer("comp_mask", comp_mask.unsqueeze(0).unsqueeze(0))
+
+    def _compress_kv(self, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compress KV by stride using average pooling + learned refinement.
+        k, v: [B, T, n_kv_heads * head_dim] -> [B, T//stride, n_kv_heads * head_dim]
+        """
+        bsz, seq_len, dim = k.shape
+        # Pad to multiple of stride
+        pad_len = (self.stride - seq_len % self.stride) % self.stride
+        if pad_len > 0:
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+        # Reshape and average pool
+        k_pooled = k.reshape(bsz, -1, self.stride, dim).mean(dim=2)
+        v_pooled = v.reshape(bsz, -1, self.stride, dim).mean(dim=2)
+        # Learned refinement
+        k_compressed = self.compress_k(k_pooled)
+        v_compressed = self.compress_v(v_pooled)
+        return k_compressed, v_compressed
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+    ):
+        bsz, seqlen, _ = x.shape
+
+        # Gated Q
+        q_and_gate = self.wq(x).view(bsz, seqlen, self.n_heads, self.head_dim * 2)
+        xq, gate = torch.chunk(q_and_gate, 2, dim=-1)
+        gate = gate.reshape(bsz, seqlen, self.d_out)
+
+        # KV (flat for compression, then reshape for attention)
+        k_flat = self.wk(x)  # [B, T, n_kv*hd]
+        v_flat = self.wv(x)  # [B, T, n_kv*hd]
+
+        xk = k_flat.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xv = v_flat.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+
+        # QK norm
+        xq = self.q_norm(xq)
+        xk_normed = self.k_norm(xk)
+
+        # Apply RoPE to Q and K at full resolution (shared across both paths)
+        q_t = xq.transpose(1, 2)
+        k_t = xk_normed.transpose(1, 2)
+        q_t, k_t = apply_rotary_emb(q_t, k_t, freqs_cos, freqs_sin)
+
+        # --- Path 1: Compressed attention (long-range) ---
+        # Compress from normed K (same space as local path) and raw V
+        k_normed_flat = xk_normed.reshape(bsz, seqlen, self.n_kv_heads * self.head_dim)
+        k_comp, v_comp = self._compress_kv(k_normed_flat, v_flat)
+        comp_len = k_comp.shape[1]
+        k_comp = k_comp.view(bsz, comp_len, self.n_kv_heads, self.head_dim)
+        v_comp = v_comp.view(bsz, comp_len, self.n_kv_heads, self.head_dim)
+
+        # RoPE for compressed K at stride-spaced positions
+        k_comp_t = k_comp.transpose(1, 2)
+        comp_positions = torch.arange(comp_len, device=x.device) * self.stride + self.stride // 2
+        comp_positions = comp_positions.clamp(max=freqs_cos.shape[0] - 1)
+        comp_cos = freqs_cos[comp_positions].unsqueeze(0).unsqueeze(0)
+        comp_sin = freqs_sin[comp_positions].unsqueeze(0).unsqueeze(0)
+        rot_dim = comp_cos.shape[-1]
+        k_rot = k_comp_t[..., :rot_dim].float()
+        half = rot_dim // 2
+        k1, k2 = k_rot[..., :half], k_rot[..., half:]
+        k_rotated = torch.cat((-k2, k1), dim=-1)
+        k_rot = (k_rot * comp_cos + k_rotated * comp_sin).type_as(k_comp_t)
+        k_comp_t = torch.cat([k_rot, k_comp_t[..., rot_dim:]], dim=-1)
+
+        # GQA expand for compressed path
+        k_comp_t = repeat_kv(k_comp_t.transpose(1, 2), self.n_rep).transpose(1, 2)
+        v_comp_t = repeat_kv(v_comp, self.n_rep).transpose(1, 2)
+
+        # Use precomputed causal mask
+        comp_causal = self.comp_mask[:, :, :seqlen, :comp_len]
+
+        comp_out = torch.nn.functional.scaled_dot_product_attention(
+            q_t, k_comp_t, v_comp_t, attn_mask=comp_causal,
+            dropout_p=self.dropout if self.training else 0.0, is_causal=False)
+
+        # --- Path 2: Local window attention (fine-grained) ---
+        # GQA expand for local path (k_t is [B, H_kv, T, D], repeat_kv expects [B, T, H_kv, D])
+        k_local = repeat_kv(k_t.transpose(1, 2), self.n_rep).transpose(1, 2)
+        v_local = repeat_kv(xv, self.n_rep).transpose(1, 2)
+
+        local_out = torch.nn.functional.scaled_dot_product_attention(
+            q_t, k_local, v_local, attn_mask=self.local_mask[:, :, :seqlen, :seqlen],
+            dropout_p=self.dropout if self.training else 0.0, is_causal=False)
+
+        # --- Blend compressed and local ---
+        comp_context = comp_out.transpose(1, 2).contiguous().view(bsz, seqlen, self.d_out)
+        local_context = local_out.transpose(1, 2).contiguous().view(bsz, seqlen, self.d_out)
+
+        blend = torch.sigmoid(self.blend_gate(x))
+        context = blend * comp_context + (1 - blend) * local_context
+
+        # Apply Q gate
+        context = context * torch.sigmoid(gate)
+
+        output = self.wo(context)
+        output = self.resid_dropout(output)
+        return output
 
 
 class ExitGate(nn.Module):
@@ -704,6 +894,8 @@ class TransformerBlock(nn.Module):
             self.attention = Attention(args)
         elif layer_type == "window":
             self.attention = Attention(args, window_size=args.window_size)
+        elif layer_type == "csa":
+            self.attention = CompressedSparseAttention(args)
         else:
             self.attention = LinearAttention(args, layer_idx=layer_id)
 
@@ -719,52 +911,60 @@ class TransformerBlock(nn.Module):
             self.attn_res = BlockAttnRes(args.dim, eps=args.norm_eps)
             self.mlp_res = BlockAttnRes(args.dim, eps=args.norm_eps)
 
+        # Hyper-connections: learned residual scaling per sublayer (mutually exclusive with attnres)
+        if args.hyper_connections:
+            assert args.attnres_block_size == 0, \
+                "hyper_connections and attnres_block_size>0 are mutually exclusive"
+            self.hc_attn = HyperConnection(args.dim)
+            self.hc_ffn = HyperConnection(args.dim)
+
     def forward(self, blocks, partial_block, freqs_cos, freqs_sin,
                 loop_cached_states=None, loop_cached_contexts=None):
-        # loop_cached_states/contexts: passed to LinearAttention for loop-axis MC
-        # (ignored for full attention layers)
         lcs = loop_cached_states if self.layer_type == "linear" else None
         lcc = loop_cached_contexts if self.layer_type == "linear" else None
 
         if self.attnres_block_size > 0:
-            # Block boundary: snapshot partial_block and start fresh
             sublayer_idx = self.layer_id * 2
             if sublayer_idx > 0 and sublayer_idx % self.attnres_block_size == 0:
                 blocks = blocks + [partial_block]
-                # Attend over completed blocks to produce input for attention
-                # (partial_block is the last completed block, already in blocks)
                 h = self.attn_res(blocks, blocks[-1])
             else:
-                # Before attention: attend over blocks + current partial
                 h = self.attn_res(blocks, partial_block)
 
-            # Attention sub-layer
-            if self.layer_type != "linear":
-                attn_out = self.attention(self.attention_norm(h), freqs_cos, freqs_sin)
-            else:
+            if self.layer_type == "linear":
                 attn_out = self.attention(self.attention_norm(h), lcs, lcc)
+            else:
+                attn_out = self.attention(self.attention_norm(h), freqs_cos, freqs_sin)
 
-            # Start new partial_block at boundary, or accumulate
             if sublayer_idx > 0 and sublayer_idx % self.attnres_block_size == 0:
                 partial_block = attn_out
             else:
                 partial_block = partial_block + attn_out
 
-            # Before MLP: attend over depth again
             h = self.mlp_res(blocks, partial_block)
-
-            # MLP sub-layer
             mlp_out = self.feed_forward(self.ffn_norm(h))
             partial_block = partial_block + mlp_out
 
             return blocks, partial_block
         else:
-            # Standard residual path (attnres disabled)
-            if self.layer_type != "linear":
-                h = partial_block + self.attention(self.attention_norm(partial_block), freqs_cos, freqs_sin)
+            # Residual path with optional hyper-connections
+            if self.layer_type == "linear":
+                attn_out = self.attention(self.attention_norm(partial_block), lcs, lcc)
             else:
-                h = partial_block + self.attention(self.attention_norm(partial_block), lcs, lcc)
-            out = h + self.feed_forward(self.ffn_norm(h))
+                attn_out = self.attention(self.attention_norm(partial_block), freqs_cos, freqs_sin)
+
+            if hasattr(self, 'hc_attn'):
+                h = self.hc_attn(partial_block, attn_out)
+            else:
+                h = partial_block + attn_out
+
+            ffn_out = self.feed_forward(self.ffn_norm(h))
+
+            if hasattr(self, 'hc_ffn'):
+                out = self.hc_ffn(h, ffn_out)
+            else:
+                out = h + ffn_out
+
             return blocks, out
 
 
@@ -785,8 +985,8 @@ class Transformer(nn.Module):
             layer_types = list(params.layer_types)
             assert len(layer_types) == params.n_layers, \
                 f"layer_types length {len(layer_types)} != n_layers {params.n_layers}"
-            assert all(t in {"full", "window", "linear"} for t in layer_types), \
-                f"invalid layer type, must be full/window/linear, got {set(layer_types)}"
+            assert all(t in {"full", "window", "csa", "linear"} for t in layer_types), \
+                f"invalid layer type, must be full/window/csa/linear, got {set(layer_types)}"
         else:
             pattern = ("linear", "linear", "linear", "full")
             layer_types = [pattern[i % len(pattern)] for i in range(params.n_layers)]

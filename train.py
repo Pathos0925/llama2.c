@@ -60,10 +60,13 @@ dropout = 0.0
 rope_base = 10_000_000.0
 partial_rotary_factor = 0.25
 # layer_types: 3 linear + 1 full, repeating. None = use default pattern.
-# Use "window" for sliding window attention layers.
+# Use "window" for sliding window, "csa" for compressed sparse attention.
 layer_types = None
 # windowed (sliding window) attention
 window_size = 256  # tokens each position can attend to in "window" layers
+# Compressed Attention (CA)
+csa_stride = 4             # compression stride
+csa_local_window = 32      # local fine-grained window size
 # linear attention params (scaled down for TinyStories)
 linear_num_key_heads = 4
 linear_num_value_heads = 4
@@ -72,6 +75,8 @@ linear_value_head_dim = 72
 linear_conv_kernel_dim = 4
 # attention residuals: 0 = disabled, >0 = block_size (sub-layers per block)
 attnres_block_size = 0
+# Hyper-Connections (learned residual scaling)
+hyper_connections = False
 # Memory Caching (MC) for linear attention layers
 mc_segment_size = 0        # 0 = disabled; >0 = segment size in tokens
 mc_ssc_top_k = 2           # SSC: number of past segments to select
@@ -85,7 +90,8 @@ loop_training_stage = 1    # 1 = joint training, 2 = gate-only (Stage II)
 loop_mc_enabled = False    # cache linear-attn states across loop iterations
 loop_mc_top_k = 2          # top-k past loop iterations to select via SSC
 loop_mc_detach = True      # detach loop-cached states from grad graph
-# adamw optimizer
+# optimizer
+optimizer_type = "adamw"   # "adamw" or "muon"
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
 max_iters = 100000  # total number of training iterations
@@ -93,6 +99,9 @@ weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
+# muon optimizer params (only used when optimizer_type="muon")
+muon_momentum = 0.95
+muon_ns_iters = 5
 # learning rate decay settings
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
@@ -280,12 +289,15 @@ model_args = dict(
     partial_rotary_factor=partial_rotary_factor,
     layer_types=layer_types,
     window_size=window_size,
+    csa_stride=csa_stride,
+    csa_local_window=csa_local_window,
     linear_num_key_heads=linear_num_key_heads,
     linear_num_value_heads=linear_num_value_heads,
     linear_key_head_dim=linear_key_head_dim,
     linear_value_head_dim=linear_value_head_dim,
     linear_conv_kernel_dim=linear_conv_kernel_dim,
     attnres_block_size=attnres_block_size,
+    hyper_connections=hyper_connections,
     mc_segment_size=mc_segment_size,
     mc_ssc_top_k=mc_ssc_top_k,
     mc_detach_cached_states=mc_detach_cached_states,
@@ -346,7 +358,37 @@ if loop_max_steps > 1:
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+if optimizer_type == "muon":
+    from muon import Muon
+    # Muon for 2D matmul weights (excluding embeddings/output head)
+    # AdamW for: 1D params (biases, norms), embeddings, and tied output weights
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+    seen_params = set()
+    muon_params = []
+    adamw_params = []
+    for name, p in param_dict.items():
+        if id(p) in seen_params:
+            continue
+        seen_params.add(id(p))
+        # Embeddings and tied output head go to AdamW
+        if 'tok_embeddings' in name or 'output' in name:
+            adamw_params.append(p)
+        elif p.dim() >= 2:
+            muon_params.append(p)
+        else:
+            adamw_params.append(p)
+    num_muon = sum(p.numel() for p in muon_params)
+    num_adamw = sum(p.numel() for p in adamw_params)
+    print(f"Muon optimizer: {len(muon_params)} tensors ({num_muon:,} params), "
+          f"AdamW fallback: {len(adamw_params)} tensors ({num_adamw:,} params)")
+    optimizer = Muon(
+        muon_params, adamw_params=adamw_params,
+        lr=learning_rate, momentum=muon_momentum,
+        adamw_lr=learning_rate * 0.1, adamw_betas=(beta1, beta2),
+        weight_decay=weight_decay, ns_iters=muon_ns_iters,
+    )
+else:
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == "resume" and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory

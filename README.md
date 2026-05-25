@@ -157,6 +157,40 @@ LoopLM requires careful training. The config uses these stability measures:
 
 See `LOOPLM_IMPLEMENTATION_PLAN.md` for detailed design documentation.
 
+## DeepSeek V4 Innovations
+
+Three architectural/training innovations from DeepSeek V4 are available:
+
+### Compressed Attention (CA)
+
+The `"csa"` layer type replaces sliding window attention with a compressed + local dual-path design. A learned stride-N compressor (average pool + linear refinement) produces compressed KV representations, and queries attend to both the compressed long-range context and a local fine-grained window. A learned gate blends the two outputs per-token.
+
+```python
+layer_types = ("linear", "linear", "csa", "full") * 3
+csa_stride = 4          # compress every 4 tokens into 1
+csa_local_window = 32   # local fine-grained window
+```
+
+### Hyper-Connections
+
+Learned per-layer residual scaling that gives each dimension control over the residual vs sublayer contribution. Zero-initialized so it starts as standard residual connections but can learn optimal balance during training.
+
+```python
+hyper_connections = True
+attnres_block_size = 0  # mutually exclusive with block attention residuals
+```
+
+### Muon Optimizer
+
+Newton-Schulz orthogonalization of the momentum buffer before each step. Normalizes all singular values toward 1, producing faster convergence. Uses Nesterov momentum and shape-aware LR scaling. Embeddings and output head use AdamW fallback.
+
+```python
+optimizer_type = "muon"
+learning_rate = 0.02     # standard Muon LR (higher than AdamW)
+muon_momentum = 0.95
+muon_ns_iters = 5
+```
+
 ## wandb logging
 
 Training metrics are optionally logged to [Weights & Biases](https://wandb.ai). Enable with:
@@ -202,6 +236,7 @@ Benchmarked on the `simplestories_50m_loop_window` config (50M params, loop_max_
 | GPU | Iter time | MFU | Tokens/sec | ETA (17K steps) |
 |-----|-----------|-----|------------|-----------------|
 | 1x NVIDIA B200 (178 GB) | ~2,055 ms | ~15.1% | ~127K | ~9.7 hours |
+| 8x NVIDIA H100 (80 GB) | ~1,185 ms | ~3.3% | ~221K | ~5.6 hours |
 
 DDP multi-GPU is supported via `torchrun --standalone --nproc_per_node=N train.py ...`.
 
@@ -240,6 +275,7 @@ Training configs live in the `config/` directory:
 | `qwen3_simplestories_4k_mc.py` | + Memory Caching (SSC) |
 | `qwen3_simplestories_4k_loop_mc.py` | + LoopLM + Loop-Cached Reasoning |
 | `simplestories_50m_loop_window_B200.py` | 50M param LoopLM + windowed attention (B200-tuned) |
+| `simplestories_50m_dsv4.py` | 50M param with DeepSeek V4 innovations (8xH100-tuned) |
 
 You can also override individual params: `python train.py config/qwen3_suggested.py --max_iters=50000`
 
