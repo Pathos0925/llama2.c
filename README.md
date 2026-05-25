@@ -1,292 +1,118 @@
-## llama2.c with Qwen3.5 Loop-Cached Reasoning
+# Chat with a 95M parameter model.
 
 <p align="center">
   <img src="assets/llamathink.jpg" width="430" height="300" alt="Llama Think">
 </p>
 
-> **Architecture update:** This fork has been migrated from the original Llama 2 architecture to **Qwen3.5**. Both Python training and C inference (fp32 + int8 quantized) are fully working. See [Architecture changes](#architecture-changes) below.
+A 95.7M parameter hybrid-attention language model pretrained on [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) (10B tokens) and finetuned on simple conversations. Built on a Qwen3.5 backbone with DeepSeek V4 architectural innovations, trained with the Muon optimizer on 4x NVIDIA B300 GPUs.
 
-Train a Qwen3.5 hybrid-attention LLM in PyTorch, then inference it in pure C. Based on Karpathy's [llama2.c](https://github.com/karpathy/llama2.c), updated with the Qwen3.5 architecture: hybrid linear/full attention layers, gated Q projections, partial RoPE, and Gated Delta Net linear attention.
+## Model architecture
 
-Small LLMs can have surprisingly strong performance if you make the domain narrow enough (ref: [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) paper). This repo is a "fullstack" train + inference solution with focus on minimalism and simplicity.
+| | |
+|---|---|
+| **Parameters** | 95.7M |
+| **Dimensions** | 576 |
+| **Layers** | 16 (hybrid pattern) |
+| **Attention heads** | 9 (3 KV heads, GQA) |
+| **Head dim** | 64 |
+| **Context length** | 1024 tokens |
+| **Vocabulary** | 32K (Llama 2 tokenizer) |
+| **RoPE** | Partial (50%), theta=20K |
 
-### quick start
+### Hybrid attention layers
 
-```bash
-# Train a model
-python tinystories.py download
-python tinystories.py pretokenize
-python train.py config/qwen3_suggested.py
+The model uses a repeating 4-layer pattern: **2 linear + 1 compressed + 1 full attention**, tiled 4 times.
 
-# Or train on SimpleStories with a custom 4K tokenizer
-python simplestories.py download
-python simplestories.py train_vocab --vocab_size=4096
-python simplestories.py pretokenize --vocab_size=4096
-python train.py config/qwen3_simplestories_4k.py
-
-# Export and run in C (fp32)
-python export.py out/model.bin --version 3 --checkpoint out/ckpt.pt
-gcc -O2 -o run run.c -lm
-./run out/model.bin -i "Once upon a time" -n 256
-
-# Or quantized (int8, ~3.4x smaller, ~25% faster)
-python export.py out/model_q8.bin --version 4 --checkpoint out/ckpt.pt
-gcc -O2 -o runq runq.c -lm
-./runq out/model_q8.bin -i "Once upon a time" -n 256
-
-# Python inference (for testing/comparison)
-python inference.py --checkpoint out/ckpt.pt --prompt "Once upon a time"
+```
+linear → linear → CSA → full  (×4 = 16 layers)
 ```
 
-## models
-
-| model | dim | n_layers | n_heads | n_kv_heads | max context length | parameters | val loss | download
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 260K | 64 | 5 | 8 | 4 | 512 | 260K | 1.297 | [stories260K](https://huggingface.co/karpathy/tinyllamas/tree/main/stories260K)
-| OG | 288 | 6 | 6 | 6 | 256 | 15M | 1.072 | [stories15M.bin](https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin) |
-| 42M| 512 | 8 | 8 | 8 | 1024 | 42M | 0.847 | [stories42M.bin](https://huggingface.co/karpathy/tinyllamas/resolve/main/stories42M.bin) |
-| 110M| 768 | 12 | 12 | 12 | 1024 | 110M | 0.760 | [stories110M.bin](https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.bin) |
-
-## architecture changes
-
-The model architecture has been updated from Llama 2 to Qwen3.5. Key differences:
-
-| Feature | Llama 2 (original) | Qwen3.5 (current) |
-|---------|--------------------|--------------------|
-| **Normalization** | RMSNorm, weight init=1 | RMSNorm, zero-init weight, `x * (1 + weight)` |
-| **RoPE** | Full head_dim, theta=10K | Partial rotary (25%), theta=10M |
-| **Full attention** | Standard Q projection | Gated Q (2x width + sigmoid gate), QK norm |
-| **Linear attention** | N/A | Gated Delta Net with causal depthwise conv |
-| **Windowed attention** | N/A | Sliding window causal attention (configurable window size) |
-| **Layer pattern** | All identical | Hybrid: linear, window, and full attention, repeating |
-| **FFN** | SwiGLU | SwiGLU (unchanged) |
-
-The hybrid attention design supports three layer types: **linear** (Gated Delta Net, O(n) recurrence), **window** (sliding window causal attention, O(n·w) where w is window size), and **full** (standard softmax attention, O(n²)). These can be mixed freely via the `layer_types` config.
-
-### Windowed (Sliding Window) Attention
-
-The `"window"` layer type implements sliding window causal attention. Each position can only attend to the nearest `window_size` tokens (including itself), reducing the quadratic cost of full attention while preserving local context. This is useful for long sequences where full attention is too expensive but linear attention alone may lose fine-grained local information.
-
-```python
-# Mix windowed attention into the layer pattern
-layer_types = ("linear", "linear", "window", "full")  # repeating pattern
-window_size = 128  # each windowed layer attends to 128 past tokens
-```
-
-Windowed attention uses the same Qwen3.5-style gated Q projection and QK norm as full attention.
-
-### Block Attention Residuals
-
-Optional block-level attention residuals from [Moonshot AI (arXiv:2603.15031)](https://arxiv.org/abs/2603.15031). Instead of standard residual connections, sub-layers are grouped into blocks and an attention mechanism over completed blocks produces the input for each sub-layer. Enabled by setting `attnres_block_size > 0` (counts sub-layers: attention + MLP = 2 per transformer layer).
-
-### export formats
-
-| Version | Format | Command | C binary |
-|---------|--------|---------|----------|
-| v3 | fp32 | `python export.py out/model.bin --version 3 --checkpoint out/ckpt.pt` | `run` |
-| v4 | int8 Q8_0 | `python export.py out/model_q8.bin --version 4 --checkpoint out/ckpt.pt` | `runq` |
-
-Older v0/v1/v2 formats from the original llama2.c are incompatible with the new Qwen3.5 model.
-
-## Memory Caching (MC)
-
-The linear attention layers optionally support **Memory Caching** from ["Memory Caching: RNNs with Growing Memory"](https://arxiv.org/abs/2602.24281). MC segments the sequence and caches the Gated Delta Net state at segment boundaries, allowing each token to query compressed memories from earlier segments. This gives linear attention layers a growing memory that interpolates between the fixed state of RNNs and the full KV cache of Transformers.
-
-We use the **Sparse Selective Caching (SSC)** aggregation strategy: a learned router selects the top-k most relevant cached segment memories per token, then softmax-weights their outputs with the current segment's online output.
-
-MC is disabled by default (`mc_segment_size=0`) with zero overhead. To enable it:
-
-```python
-# In a config file or via command line
-mc_segment_size = 128      # segment size in tokens (0=disabled)
-mc_ssc_top_k = 2           # number of past segments to select per token
-mc_detach_cached_states = True  # detach cached states from grad graph (saves memory)
-```
-
-```bash
-python train.py config/qwen3_simplestories_4k_mc.py
-```
-
-See `MEMORY_CACHING_PLAN.md` for detailed design documentation.
-
-## LoopLM (Loop-Cached Reasoning)
-
-The model optionally supports **LoopLM** — weight-tied layer looping with adaptive exit — based on ["Scaling Latent Reasoning via Looped Language Models"](https://arxiv.org/abs/2501.xxxxx) (Zhu et al., 2025). LoopLM reuses the same transformer layers T times, giving the model more depth of computation without adding parameters. A learned exit gate predicts when to stop looping.
-
-Combined with Memory Caching, this creates **Loop-Cached Reasoning**: after each loop iteration, the linear attention memory states are cached and made available to subsequent loops via SSC. This gives the model a structured, queryable record of what each pass of reasoning discovered — preventing "reasoning regression" where later loops overwrite useful features from earlier loops.
-
-### how it works
-
-1. **Weight-tied looping**: The same layer stack runs T times. Each loop refines the hidden states.
-2. **Exit gate**: A learned gate predicts per-token exit probability at each step. At inference, tokens exit early once the cumulative exit probability exceeds a threshold.
-3. **Loop-axis Memory Caching** (optional): After each loop, the final recurrent state of each linear attention layer is cached. Subsequent loops query these cached states via SSC with a separate router projection, blending insights from prior loops with the current loop's output.
-4. **Two-stage training**:
-   - **Stage I**: Joint training with entropy-regularized expected loss. The exit distribution weights per-step losses, and an entropy bonus prevents collapse to always-max-loops.
-   - **Stage II**: Freeze the LM, train only the exit gate on a per-step improvement signal (does this loop step still help?).
-
-### configuration
-
-LoopLM is disabled by default (`loop_max_steps=1`) with zero overhead — no exit gate or extra projections are allocated.
-
-```python
-# LoopLM
-loop_max_steps = 4          # number of loop iterations (1=disabled)
-loop_kl_beta = 0.1          # entropy regularization coefficient (Stage I)
-loop_exit_threshold = 0.9   # CDF threshold for early exit at inference
-loop_training_stage = 1     # 1=joint training, 2=gate-only (Stage II)
-
-# Loop-axis Memory Caching (requires mc_segment_size > 0)
-loop_mc_enabled = True      # cache linear-attn states across loop iterations
-loop_mc_top_k = 2           # top-k prior loop iterations to select via SSC
-loop_mc_detach = True       # detach loop-cached states from grad graph
-```
-
-```bash
-python train.py config/qwen3_simplestories_4k_loop_mc.py
-```
-
-### training notes
-
-LoopLM requires careful training. The config uses these stability measures:
-
-- **Conservative learning rate** (5e-4 vs. 1e-3 for non-looped) — recurrent architectures need smaller LR
-- **Gradient clipping** at 1.0 — essential when gradients flow through T iterations
-- **KL coefficient annealing** — `loop_kl_beta` linearly decays to 50% over the second half of training
-- **Reduced batch size** (16 vs. 32) with increased gradient accumulation (8 vs. 4) — T loop iterations per step consume more memory
-- **`compile=False`** — the loop with dynamic exit and MC segment loops cause graph breaks
-
-See `LOOPLM_IMPLEMENTATION_PLAN.md` for detailed design documentation.
-
-## DeepSeek V4 Innovations
-
-Three architectural/training innovations from DeepSeek V4 are available:
-
-### Compressed Attention (CA)
-
-The `"csa"` layer type replaces sliding window attention with a compressed + local dual-path design. A learned stride-N compressor (average pool + linear refinement) produces compressed KV representations, and queries attend to both the compressed long-range context and a local fine-grained window. A learned gate blends the two outputs per-token.
-
-```python
-layer_types = ("linear", "linear", "csa", "full") * 3
-csa_stride = 4          # compress every 4 tokens into 1
-csa_local_window = 32   # local fine-grained window
-```
+- **Linear attention** (Gated Delta Net) — O(n) recurrence with causal depthwise conv, learned gating, and delta rule updates. 9 key/value heads, 112-dim keys and values.
+- **Compressed Sparse Attention (CSA)** — Dual-path design from DeepSeek V4. A learned stride-4 compressor produces compressed KV for long-range context, while a 64-token local window preserves fine-grained detail. A learned gate blends the two paths per-token.
+- **Full attention** — Standard softmax causal attention with gated Q projections, QK normalization, and grouped-query attention (9 heads, 3 KV heads).
 
 ### Hyper-Connections
 
-Learned per-layer residual scaling that gives each dimension control over the residual vs sublayer contribution. Zero-initialized so it starts as standard residual connections but can learn optimal balance during training.
+Every layer uses learned per-dimension residual scaling (zero-initialized). Instead of `h = h + sublayer(h)`, each sublayer computes:
 
-```python
-hyper_connections = True
-attnres_block_size = 0  # mutually exclusive with block attention residuals
+```
+h = (1 + residual_scale) * h + (1 + sublayer_scale) * sublayer(h)
 ```
 
-### Muon Optimizer
+This gives the model fine-grained control over information flow without adding meaningful parameter count.
 
-Newton-Schulz orthogonalization of the momentum buffer before each step. Normalizes all singular values toward 1, producing faster convergence. Uses Nesterov momentum and shape-aware LR scaling. Embeddings and output head use AdamW fallback.
+## Training
 
-```python
-optimizer_type = "muon"
-learning_rate = 0.02     # standard Muon LR (higher than AdamW)
-muon_momentum = 0.95
-muon_ns_iters = 5
+### Optimizer: Muon
+
+[Muon](https://github.com/KellerJordan/Muon) applies Newton-Schulz orthogonalization to the momentum buffer, normalizing all singular values toward 1 for faster convergence. Embeddings and the output head fall back to AdamW.
+
+| | |
+|---|---|
+| **Learning rate** | 0.02 (Muon) / 0.002 (AdamW fallback) |
+| **Momentum** | 0.95 (Nesterov) |
+| **NS iterations** | 5 |
+| **Weight decay** | 0.01 |
+| **Gradient clip** | 1.0 |
+| **Warmup** | 500 steps |
+| **Schedule** | Cosine decay to 0 |
+
+### Pretraining data: FineWeb
+
+Pretrained on [FineWeb sample-10BT](https://huggingface.co/datasets/HuggingFaceFW/fineweb) — 10 billion tokens of cleaned web text from Common Crawl, curated by HuggingFace.
+
+| | |
+|---|---|
+| **Dataset** | FineWeb sample-10BT |
+| **Documents** | 14.9M |
+| **Tokens** | ~10B |
+| **Tokenizer** | Llama 2 SentencePiece (32K vocab) |
+| **Epochs** | ~2 |
+| **Batch size** | 64 × 8 grad accum × 4 GPUs = 2.1M tokens/iter |
+| **Total iters** | 10,000 |
+
+### Hardware
+
+4x NVIDIA B300 SXM6 (275 GB HBM3e each). With `torch.compile`, steady-state iteration time is ~2.35s at 23% MFU. Full pretraining takes approximately 7 hours.
+
+## Quick start
+
+### Pretrain from scratch
+
+```bash
+# Download and tokenize FineWeb (10B tokens, ~28 GB download)
+python fineweb.py download
+python fineweb.py pretokenize
+
+# Train on 4 GPUs
+torchrun --standalone --nproc_per_node=4 train.py config/fineweb_95m_dsv4_4xB300.py
 ```
 
-## wandb logging
+### Export and run in C
 
-Training metrics are optionally logged to [Weights & Biases](https://wandb.ai). Enable with:
-
-```python
-wandb_log = True
-wandb_project = "llamac"
-wandb_run_name = "my_run"
+```bash
+python export.py out_fineweb_95m_dsv4/model.bin --version 3 --checkpoint out_fineweb_95m_dsv4/ckpt.pt
+gcc -O2 -o run run.c -lm
+./run out_fineweb_95m_dsv4/model.bin -i "The history of" -n 256
 ```
 
-Logged metrics include train/val loss, learning rate, MFU, and iteration time. When LoopLM is enabled, per-loop-step losses, exit probability distribution, mean exit step, and KL beta are also logged.
+### Monitor training
 
-Sample text generations are logged as wandb Tables every `sample_interval` steps (default 500), letting you watch output quality improve during training.
-
-## Checkpoint saving and R2 upload
-
-Checkpoints can be saved periodically and uploaded to Cloudflare R2 (S3-compatible) for resilience on interruptible/spot instances. Both a rolling `ckpt.pt` and a versioned `ckpt_step{N}.pt` are uploaded each time.
-
-```python
-save_interval = 500         # save every N steps (0 = only at eval)
-r2_upload = True
-r2_endpoint = "https://<account-id>.r2.cloudflarestorage.com"
-r2_bucket = "my-bucket"
-r2_prefix = "my-project/"   # path prefix in bucket
+```bash
+tail -f train.log                          # live output
+grep "| loss" train.log | tail -20         # recent loss values
+nvidia-smi                                 # GPU utilization
 ```
 
-R2 credentials (`access_key_id` and `secret_access_key`) are read from a `.env` file in the project root. Checkpoints are also saved locally to `out_dir` as before.
+Training metrics (loss, LR, MFU, samples) are logged to [Weights & Biases](https://wandb.ai). Checkpoints are saved every 1000 steps and uploaded to Cloudflare R2.
 
-## Flash Linear Attention (fla)
+## Flash Linear Attention
 
-The linear attention layers can optionally use fused Triton kernels from the [`flash-linear-attention`](https://github.com/sustcsonglin/flash-linear-attention) library for significantly faster training. When `fla` is installed, it is used automatically; otherwise the naive PyTorch implementation is used as a fallback.
+The linear attention layers automatically use fused Triton kernels from [`flash-linear-attention`](https://github.com/sustcsonglin/flash-linear-attention) when installed, providing roughly 4x throughput improvement over the naive PyTorch fallback.
 
 ```bash
 pip install flash-linear-attention
 ```
-
-On an H100 with a 50M parameter model, `fla` provides roughly a **4x throughput improvement** over the naive implementation.
-
-## training speed
-
-Benchmarked on the `simplestories_50m_loop_window` config (50M params, loop_max_steps=2, batch_size=32, grad_accum=8, seq_len=1024, torch.compile=True):
-
-| GPU | Iter time | MFU | Tokens/sec | ETA (17K steps) |
-|-----|-----------|-----|------------|-----------------|
-| 1x NVIDIA B200 (178 GB) | ~2,055 ms | ~15.1% | ~127K | ~9.7 hours |
-| 8x NVIDIA H100 (80 GB) | ~1,185 ms | ~3.3% | ~221K | ~5.6 hours |
-
-DDP multi-GPU is supported via `torchrun --standalone --nproc_per_node=N train.py ...`.
-
-## datasets
-
-Three data sources are supported:
-
-- **TinyStories** — synthetic children's stories generated by GPT-3.5/4. Uses the Llama 2 tokenizer (32K vocab) by default.
-- **SimpleStories** — a more diverse dataset from [HuggingFace](https://huggingface.co/datasets/lennart-finke/SimpleStories) (~2.1M stories). Supports custom tokenizer training for smaller vocabularies (e.g., 4K tokens).
-- **SimpleConversations** — a supplementary dataset of simple dialogues in `<person1>`/`<person2>` format (`simple_conversations_filtered.jsonl`). Automatically included in vocab training and pretokenization when present in the `data/` directory.
-
-```bash
-# TinyStories
-python tinystories.py download
-python tinystories.py pretokenize
-
-# SimpleStories with custom 4K tokenizer
-python simplestories.py download
-python simplestories.py train_vocab --vocab_size=4096
-python simplestories.py pretokenize --vocab_size=4096
-
-# To include conversation data:
-cp simple_conversations_filtered.jsonl data/
-# Then run train_vocab and pretokenize as above — it is picked up automatically.
-```
-
-## config files
-
-Training configs live in the `config/` directory:
-
-| Config | Description |
-|--------|-------------|
-| `qwen3_original.py` | Original Qwen3.5 defaults on TinyStories |
-| `qwen3_suggested.py` | Tuned hyperparameters (recommended baseline) |
-| `qwen3_simplestories_4k.py` | SimpleStories with 4K custom tokenizer |
-| `qwen3_simplestories_4k_mc.py` | + Memory Caching (SSC) |
-| `qwen3_simplestories_4k_loop_mc.py` | + LoopLM + Loop-Cached Reasoning |
-| `simplestories_50m_loop_window_B200.py` | 50M param LoopLM + windowed attention (B200-tuned) |
-| `simplestories_50m_dsv4.py` | 50M param with DeepSeek V4 innovations (8xH100-tuned) |
-
-You can also override individual params: `python train.py config/qwen3_suggested.py --max_iters=50000`
-
-## unsorted todos
-
-- add support in run.c of reading version 1+ files from export, later deprecate "version 0"
-- run.cu (CUDA) investigate and merge
-- add more tests inside [test.c](test.c)
-- add Engine class for use in sample.py that does efficient inference in PyTorch, e.g. KV cache keeping
-- C inference support for LoopLM (loop unrolling + exit gate export)
-- C inference support for Memory Caching (segment loop export)
 
 ## License
 

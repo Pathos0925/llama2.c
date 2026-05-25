@@ -182,13 +182,15 @@ lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla
 min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 # validating checks
-assert dataset in ["tinystories", "simplestories"]
+assert dataset in ["tinystories", "simplestories", "fineweb"]
 assert vocab_source in ["llama2", "custom"]
 assert vocab_source == "custom" or vocab_size == 32000, "The vocab from Meta has 32K tokens"
 
 # import the right dataset Task
 if dataset == "simplestories":
     from simplestories import Task
+elif dataset == "fineweb":
+    from fineweb import Task
 else:
     from tinystories import Task
 
@@ -234,13 +236,18 @@ ctx = (
 # tokenizer for sample generation
 if dataset == "simplestories":
     from simplestories import get_tokenizer_model_path
+elif dataset == "fineweb":
+    from fineweb import get_tokenizer_model_path
 else:
     from tinystories import get_tokenizer_model_path
 _tok_model_path = get_tokenizer_model_path(vocab_size if vocab_source == "custom" else 0)
 from tokenizer import Tokenizer as _Tokenizer
 sample_tokenizer = _Tokenizer(tokenizer_model=_tok_model_path)
 
-sample_prompts = ["Once upon a time", "The cat", "A little girl named", "<person1> Hey, tell me a story!\n\n<person2>"]
+if dataset == "fineweb":
+    sample_prompts = ["The history of", "In recent years, scientists have", "The most important thing", "According to the latest research"]
+else:
+    sample_prompts = ["Once upon a time", "The cat", "A little girl named", "<person1> Hey, tell me a story!\n\n<person2>"]
 sample_interval = 500  # generate samples every N steps
 
 @torch.no_grad()
